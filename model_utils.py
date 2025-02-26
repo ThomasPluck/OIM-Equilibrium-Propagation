@@ -193,596 +193,170 @@ class P_MLP(torch.nn.Module):
         delta_phi.backward() # p.grad = -(d_Phi_2/dp - d_Phi_1/dp)/(beta_2 - beta_1) ----> dL/dp  by the theorem
         
 
-         
-# Vector Field Multi-Layer Perceptron
-
-class VF_MLP(torch.nn.Module):
-    def __init__(self, archi, activation=torch.tanh):
-        super(VF_MLP, self).__init__()
-        
-        self.activation = activation
-        self.archi = archi
-        self.softmax = False        
-        self.nc = self.archi[-1]
-
-        # Forward synapses
-        self.synapses = torch.nn.ModuleList()
-        for idx in range(len(archi)-1):
-            self.synapses.append(torch.nn.Linear(archi[idx], archi[idx+1], bias=True))
-
-        # Backward synapses
-        self.B_syn = torch.nn.ModuleList()
-        for idx in range(1, len(archi)-1):            
-            self.B_syn.append(torch.nn.Linear(archi[idx+1], archi[idx], bias=False))
-
-
-    def Phi(self, x, y, neurons, beta, criterion, neurons_2=None):
-        # For assymetric connections each layer has its own phi 
-        x = x.view(x.size(0),-1)
-        
-        layers = [x] + neurons
-        
-        phis = []
-
-        if neurons_2 is None:  # Standard case for the dynamics
-            for idx in range(len(self.synapses)-1):
-                phi = torch.sum( self.synapses[idx](layers[idx]) * layers[idx+1], dim=1).squeeze()
-                phi += torch.sum( self.B_syn[idx](layers[idx+2]) * layers[idx+1], dim=1).squeeze()
-                phis.append(phi)        
-
-            phi = torch.sum( self.synapses[-1](layers[-2]) * layers[-1], dim=1).squeeze()
-            if beta!=0.0:
-                if criterion.__class__.__name__.find('MSE')!=-1:
-                    y = F.one_hot(y, num_classes=self.nc)
-                    L = 0.5*criterion(layers[-1].float(), y.float()).sum(dim=1).squeeze()   
-                else:
-                    L = criterion(layers[-1].float(), y).squeeze()     
-                phi -= beta*L
-        
-            phis.append(phi)
-        
-        else:  # Used only for computing the vector field EP update
-            layers_2 = [x] + neurons_2
-            for idx in range(len(self.synapses)-1):
-                phi = torch.sum( self.synapses[idx](layers[idx]) * layers_2[idx+1], dim=1).squeeze()
-                phi += torch.sum( self.B_syn[idx](layers[idx+2]) * layers_2[idx+1], dim=1).squeeze()
-                phis.append(phi)        
-
-            phi = torch.sum( self.synapses[-1](layers[-2]) * layers_2[-1], dim=1).squeeze()
-            if beta!=0.0:
-                if criterion.__class__.__name__.find('MSE')!=-1:
-                    y = F.one_hot(y, num_classes=self.nc)
-                    L = 0.5*criterion(layers_2[-1].float(), y.float()).sum(dim=1).squeeze()   
-                else:
-                    L = criterion(layers_2[-1].float(), y).squeeze()     
-                phi -= beta*L
-        
-            phis.append(phi)
-
-        return phis
     
     
-    def forward(self, x, y, neurons, T, beta=0.0, criterion=torch.nn.MSELoss(reduction='none'), check_thm=False):
-        
-        not_mse = (criterion.__class__.__name__.find('MSE')==-1)
-        mbs = x.size(0)
-        device = x.device
-
-        for t in range(T):
-            phis = self.Phi(x, y, neurons, beta, criterion)
-            for idx in range(len(neurons)-1):
-                init_grad = torch.tensor([1 for i in range(mbs)], dtype=torch.float, device=device, requires_grad=True)
-                grad = torch.autograd.grad(phis[idx], neurons[idx], grad_outputs=init_grad, create_graph=check_thm)
-
-                neurons[idx] = self.activation( grad[0] )
-                if check_thm:
-                    neurons[idx].retain_grad()
-                else:
-                    neurons[idx].requires_grad = True
-             
-            init_grad = torch.tensor([1 for i in range(mbs)], dtype=torch.float, device=device, requires_grad=True)
-            grad = torch.autograd.grad(phis[-1], neurons[-1], grad_outputs=init_grad, create_graph=check_thm)
-            if not_mse:
-                neurons[-1] = grad[0]
-            else:
-                neurons[-1] = self.activation( grad[0] )
-
-            if check_thm:
-                neurons[-1].retain_grad()
-            else:
-                neurons[-1].requires_grad = True
-
-        return neurons
-
-
-    def init_neurons(self, mbs, device):
-        
-        neurons = []
-        append = neurons.append
-        for size in self.archi[1:]:  
-            append(torch.zeros((mbs, size), requires_grad=True, device=device))
-        return neurons
-
-
-    def compute_syn_grads(self, x, y, neurons_1, neurons_2, betas, criterion, check_thm=False):
-        
-        beta_1, beta_2 = betas
-        
-        self.zero_grad()            # p.grad is zero
-        if not(check_thm):
-            phis_1 = self.Phi(x, y, neurons_1, beta_1, criterion)
-        else:
-            phis_1 = self.Phi(x, y, neurons_1, beta_2, criterion)
-        
-        phis_2 = self.Phi(x, y, neurons_1, beta_2, criterion, neurons_2=neurons_2)
-     
-        for idx in range(len(neurons_1)):
-            phi_1 = phis_1[idx].mean()
-            phi_2 = phis_2[idx].mean()
-            delta_phi = (phi_2 - phi_1)/(beta_1 - beta_2)        
-            delta_phi.backward() # p.grad = -(d_Phi_2/dp - d_Phi_1/dp)/(beta_2 - beta_1)
-        
-
-   
     
-    
-# Convolutional Neural Network
+# # Convolutional Neural Network
 
-class P_CNN(torch.nn.Module):
-    def __init__(self, in_size, channels, kernels, strides, fc, pools, paddings, activation=hard_sigmoid, softmax=False):
-        super(P_CNN, self).__init__()
+# class P_CNN(torch.nn.Module):
+#     def __init__(self, in_size, channels, kernels, strides, fc, pools, paddings, activation=hard_sigmoid, softmax=False):
+#         super(P_CNN, self).__init__()
 
-        # Dimensions used to initialize neurons
-        self.in_size = in_size
-        self.channels = channels
-        self.kernels = kernels
-        self.strides = strides
-        self.paddings = paddings
-        self.fc = fc
-        self.nc = fc[-1]        
+#         # Dimensions used to initialize neurons
+#         self.in_size = in_size
+#         self.channels = channels
+#         self.kernels = kernels
+#         self.strides = strides
+#         self.paddings = paddings
+#         self.fc = fc
+#         self.nc = fc[-1]        
 
-        self.activation = activation
-        self.pools = pools
+#         self.activation = activation
+#         self.pools = pools
         
-        self.synapses = torch.nn.ModuleList()
+#         self.synapses = torch.nn.ModuleList()
         
-        self.softmax = softmax # whether to use softmax readout or not
+#         self.softmax = softmax # whether to use softmax readout or not
 
-        size = in_size # size of the input : 32 for cifar10
+#         size = in_size # size of the input : 32 for cifar10
 
-        for idx in range(len(channels)-1): 
-            self.synapses.append(torch.nn.Conv2d(channels[idx], channels[idx+1], kernels[idx], 
-                                                 stride=strides[idx], padding=paddings[idx], bias=True))
+#         for idx in range(len(channels)-1): 
+#             self.synapses.append(torch.nn.Conv2d(channels[idx], channels[idx+1], kernels[idx], 
+#                                                  stride=strides[idx], padding=paddings[idx], bias=True))
                 
-            size = int( (size + 2*paddings[idx] - kernels[idx])/strides[idx] + 1 )          # size after conv
-            if self.pools[idx].__class__.__name__.find('Pool')!=-1:
-                size = int( (size - pools[idx].kernel_size)/pools[idx].stride + 1 )   # size after Pool
+#             size = int( (size + 2*paddings[idx] - kernels[idx])/strides[idx] + 1 )          # size after conv
+#             if self.pools[idx].__class__.__name__.find('Pool')!=-1:
+#                 size = int( (size - pools[idx].kernel_size)/pools[idx].stride + 1 )   # size after Pool
 
-        size = size * size * channels[-1]        
-        fc_layers = [size] + fc
+#         size = size * size * channels[-1]        
+#         fc_layers = [size] + fc
 
-        for idx in range(len(fc)):
-            self.synapses.append(torch.nn.Linear(fc_layers[idx], fc_layers[idx+1], bias=True))
+#         for idx in range(len(fc)):
+#             self.synapses.append(torch.nn.Linear(fc_layers[idx], fc_layers[idx+1], bias=True))
         
 
 
-    def Phi(self, x, y, neurons, beta, criterion):
+#     def Phi(self, x, y, neurons, beta, criterion):
 
-        mbs = x.size(0)       
-        conv_len = len(self.kernels)
-        tot_len = len(self.synapses)
+#         mbs = x.size(0)       
+#         conv_len = len(self.kernels)
+#         tot_len = len(self.synapses)
 
-        layers = [x] + neurons        
-        phi = 0.0
+#         layers = [x] + neurons        
+#         phi = 0.0
 
-        #Phi computation changes depending on softmax == True or not
-        if not self.softmax:
-            for idx in range(conv_len):    
-                phi += torch.sum( self.pools[idx](self.synapses[idx](layers[idx])) * layers[idx+1], dim=(1,2,3)).squeeze()     
-            for idx in range(conv_len, tot_len):
-                phi += torch.sum( self.synapses[idx](layers[idx].view(mbs,-1)) * layers[idx+1], dim=1).squeeze()
+#         #Phi computation changes depending on softmax == True or not
+#         if not self.softmax:
+#             for idx in range(conv_len):    
+#                 phi += torch.sum( self.pools[idx](self.synapses[idx](layers[idx])) * layers[idx+1], dim=(1,2,3)).squeeze()     
+#             for idx in range(conv_len, tot_len):
+#                 phi += torch.sum( self.synapses[idx](layers[idx].view(mbs,-1)) * layers[idx+1], dim=1).squeeze()
              
-            if beta!=0.0:
-                if criterion.__class__.__name__.find('MSE')!=-1:
-                    y = F.one_hot(y, num_classes=self.nc)
-                    L = 0.5*criterion(layers[-1].float(), y.float()).sum(dim=1).squeeze()   
-                else:
-                    L = criterion(layers[-1].float(), y).squeeze()             
-                phi -= beta*L
+#             if beta!=0.0:
+#                 if criterion.__class__.__name__.find('MSE')!=-1:
+#                     y = F.one_hot(y, num_classes=self.nc)
+#                     L = 0.5*criterion(layers[-1].float(), y.float()).sum(dim=1).squeeze()   
+#                 else:
+#                     L = criterion(layers[-1].float(), y).squeeze()             
+#                 phi -= beta*L
 
-        else:
-            # the output layer used for the prediction is no longer part of the system ! Summing until len(self.synapses) - 1 only
-            for idx in range(conv_len):
-                phi += torch.sum( self.pools[idx](self.synapses[idx](layers[idx])) * layers[idx+1], dim=(1,2,3)).squeeze()     
-            for idx in range(conv_len, tot_len-1):
-                phi += torch.sum( self.synapses[idx](layers[idx].view(mbs,-1)) * layers[idx+1], dim=1).squeeze()
+#         else:
+#             # the output layer used for the prediction is no longer part of the system ! Summing until len(self.synapses) - 1 only
+#             for idx in range(conv_len):
+#                 phi += torch.sum( self.pools[idx](self.synapses[idx](layers[idx])) * layers[idx+1], dim=(1,2,3)).squeeze()     
+#             for idx in range(conv_len, tot_len-1):
+#                 phi += torch.sum( self.synapses[idx](layers[idx].view(mbs,-1)) * layers[idx+1], dim=1).squeeze()
              
-            # the prediction is made with softmax[last weights[penultimate layer]]
-            if beta!=0.0:
-                L = criterion(self.synapses[-1](layers[-1].view(mbs,-1)).float(), y).squeeze()             
-                phi -= beta*L            
+#             # the prediction is made with softmax[last weights[penultimate layer]]
+#             if beta!=0.0:
+#                 L = criterion(self.synapses[-1](layers[-1].view(mbs,-1)).float(), y).squeeze()             
+#                 phi -= beta*L            
         
-        return phi
+#         return phi
     
 
-    def forward(self, x, y, neurons, T, beta=0.0, criterion=torch.nn.MSELoss(reduction='none'), check_thm=False):
+#     def forward(self, x, y, neurons, T, beta=0.0, criterion=torch.nn.MSELoss(reduction='none'), check_thm=False):
  
-        not_mse = (criterion.__class__.__name__.find('MSE')==-1)
-        mbs = x.size(0)
-        device = x.device     
+#         not_mse = (criterion.__class__.__name__.find('MSE')==-1)
+#         mbs = x.size(0)
+#         device = x.device     
         
-        if check_thm:
-            for t in range(T):
-                phi = self.Phi(x, y, neurons, beta, criterion)
-                init_grads = torch.tensor([1 for i in range(mbs)], dtype=torch.float, device=device, requires_grad=True)
-                grads = torch.autograd.grad(phi, neurons, grad_outputs=init_grads, create_graph=True)
+#         if check_thm:
+#             for t in range(T):
+#                 phi = self.Phi(x, y, neurons, beta, criterion)
+#                 init_grads = torch.tensor([1 for i in range(mbs)], dtype=torch.float, device=device, requires_grad=True)
+#                 grads = torch.autograd.grad(phi, neurons, grad_outputs=init_grads, create_graph=True)
 
-                for idx in range(len(neurons)-1):
-                    neurons[idx] = self.activation( grads[idx] )
-                    neurons[idx].retain_grad()
+#                 for idx in range(len(neurons)-1):
+#                     neurons[idx] = self.activation( grads[idx] )
+#                     neurons[idx].retain_grad()
              
-                if not_mse and not(self.softmax):
-                    neurons[-1] = grads[-1]
-                else:
-                    neurons[-1] = self.activation( grads[-1] )
+#                 if not_mse and not(self.softmax):
+#                     neurons[-1] = grads[-1]
+#                 else:
+#                     neurons[-1] = self.activation( grads[-1] )
 
-                neurons[-1].retain_grad()
-        else:
-             for t in range(T):
-                phi = self.Phi(x, y, neurons, beta, criterion)
-                init_grads = torch.tensor([1 for i in range(mbs)], dtype=torch.float, device=device, requires_grad=True)
-                grads = torch.autograd.grad(phi, neurons, grad_outputs=init_grads, create_graph=False)
+#                 neurons[-1].retain_grad()
+#         else:
+#              for t in range(T):
+#                 phi = self.Phi(x, y, neurons, beta, criterion)
+#                 init_grads = torch.tensor([1 for i in range(mbs)], dtype=torch.float, device=device, requires_grad=True)
+#                 grads = torch.autograd.grad(phi, neurons, grad_outputs=init_grads, create_graph=False)
 
-                for idx in range(len(neurons)-1):
-                    neurons[idx] = self.activation( grads[idx] )
-                    neurons[idx].requires_grad = True
+#                 for idx in range(len(neurons)-1):
+#                     neurons[idx] = self.activation( grads[idx] )
+#                     neurons[idx].requires_grad = True
              
-                if not_mse and not(self.softmax):
-                    neurons[-1] = grads[-1]
-                else:
-                    neurons[-1] = self.activation( grads[-1] )
+#                 if not_mse and not(self.softmax):
+#                     neurons[-1] = grads[-1]
+#                 else:
+#                     neurons[-1] = self.activation( grads[-1] )
 
-                neurons[-1].requires_grad = True
+#                 neurons[-1].requires_grad = True
 
-        return neurons
+#         return neurons
        
 
-    def init_neurons(self, mbs, device):
+#     def init_neurons(self, mbs, device):
         
-        neurons = []
-        append = neurons.append
-        size = self.in_size
-        for idx in range(len(self.channels)-1): 
-            size = int( (size + 2*self.paddings[idx] - self.kernels[idx])/self.strides[idx] + 1 )   # size after conv
-            if self.pools[idx].__class__.__name__.find('Pool')!=-1:
-                size = int( (size - self.pools[idx].kernel_size)/self.pools[idx].stride + 1 )  # size after Pool
-            append(torch.zeros((mbs, self.channels[idx+1], size, size), requires_grad=True, device=device))
+#         neurons = []
+#         append = neurons.append
+#         size = self.in_size
+#         for idx in range(len(self.channels)-1): 
+#             size = int( (size + 2*self.paddings[idx] - self.kernels[idx])/self.strides[idx] + 1 )   # size after conv
+#             if self.pools[idx].__class__.__name__.find('Pool')!=-1:
+#                 size = int( (size - self.pools[idx].kernel_size)/self.pools[idx].stride + 1 )  # size after Pool
+#             append(torch.zeros((mbs, self.channels[idx+1], size, size), requires_grad=True, device=device))
 
-        size = size * size * self.channels[-1]
+#         size = size * size * self.channels[-1]
         
-        if not self.softmax:
-            for idx in range(len(self.fc)):
-                append(torch.zeros((mbs, self.fc[idx]), requires_grad=True, device=device))
-        else:
-            # we *REMOVE* the output layer from the system
-            for idx in range(len(self.fc) - 1):
-                append(torch.zeros((mbs, self.fc[idx]), requires_grad=True, device=device))            
+#         if not self.softmax:
+#             for idx in range(len(self.fc)):
+#                 append(torch.zeros((mbs, self.fc[idx]), requires_grad=True, device=device))
+#         else:
+#             # we *REMOVE* the output layer from the system
+#             for idx in range(len(self.fc) - 1):
+#                 append(torch.zeros((mbs, self.fc[idx]), requires_grad=True, device=device))            
             
-        return neurons
+#         return neurons
 
-    def compute_syn_grads(self, x, y, neurons_1, neurons_2, betas, criterion, check_thm=False):
+#     def compute_syn_grads(self, x, y, neurons_1, neurons_2, betas, criterion, check_thm=False):
         
-        beta_1, beta_2 = betas
+#         beta_1, beta_2 = betas
         
-        self.zero_grad()            # p.grad is zero
-        if not(check_thm):
-            phi_1 = self.Phi(x, y, neurons_1, beta_1, criterion)
-        else:
-            phi_1 = self.Phi(x, y, neurons_1, beta_2, criterion)
-        phi_1 = phi_1.mean()
+#         self.zero_grad()            # p.grad is zero
+#         if not(check_thm):
+#             phi_1 = self.Phi(x, y, neurons_1, beta_1, criterion)
+#         else:
+#             phi_1 = self.Phi(x, y, neurons_1, beta_2, criterion)
+#         phi_1 = phi_1.mean()
         
-        phi_2 = self.Phi(x, y, neurons_2, beta_2, criterion)
-        phi_2 = phi_2.mean()
+#         phi_2 = self.Phi(x, y, neurons_2, beta_2, criterion)
+#         phi_2 = phi_2.mean()
         
-        delta_phi = (phi_2 - phi_1)/(beta_1 - beta_2)        
-        delta_phi.backward() # p.grad = -(d_Phi_2/dp - d_Phi_1/dp)/(beta_2 - beta_1) ----> dL/dp  by the theorem
+#         delta_phi = (phi_2 - phi_1)/(beta_1 - beta_2)        
+#         delta_phi.backward() # p.grad = -(d_Phi_2/dp - d_Phi_1/dp)/(beta_2 - beta_1) ----> dL/dp  by the theorem
  
-           
-   
- 
-# Vector Field Convolutional Neural Network
-
-class VF_CNN(torch.nn.Module):
-    def __init__(self, in_size, channels, kernels, strides, fc, pools, paddings, activation=hard_sigmoid, softmax = False, same_update=False):
-        super(VF_CNN, self).__init__()
-
-        # Dimensions used to initialize neurons
-        self.in_size = in_size
-        self.channels = channels
-        self.kernels = kernels
-        self.strides = strides
-        self.paddings = paddings
-        self.fc = fc
-        self.nc = fc[-1]        
-
-        self.activation = activation
-        self.pools = pools
-        
-        self.synapses = torch.nn.ModuleList()  # forward connections
-        self.B_syn = torch.nn.ModuleList()     # backward connections
-
-        self.same_update = same_update         # whether to use the same update for forward ans backward connections
-        self.softmax = softmax                 # whether to use softmax readout
-
-
-        size = in_size
-
-        for idx in range(len(channels)-1): 
-            self.synapses.append(torch.nn.Conv2d(channels[idx], channels[idx+1], kernels[idx], 
-                                                 stride=strides[idx], padding=paddings[idx], bias=True))
-                
-            if idx>0:  # backward synapses except for first layer
-                self.B_syn.append(torch.nn.Conv2d(channels[idx], channels[idx+1], kernels[idx],
-                                                      stride=strides[idx], padding=paddings[idx], bias=False))
-
-            size = int( (size + 2*paddings[idx] - kernels[idx])/strides[idx] + 1 )          # size after conv
-            if self.pools[idx].__class__.__name__.find('Pool')!=-1:
-                size = int( (size - pools[idx].kernel_size)/pools[idx].stride + 1 )   # size after Pool
-
-        size = size * size * channels[-1]
-        
-        fc_layers = [size] + fc
-
-        for idx in range(len(fc)):
-            self.synapses.append(torch.nn.Linear(fc_layers[idx], fc_layers[idx+1], bias=True))
-            if not(self.softmax and (idx==(len(fc)-1))):
-                self.B_syn.append(torch.nn.Linear(fc_layers[idx], fc_layers[idx+1], bias=False))
-
-
-    def angle(self): # computes the angle between forward and backward weights
-        angles = []
-        with torch.no_grad():
-            for idx in range(len(self.B_syn)):
-                fnorm = self.synapses[idx+1].weight.data.pow(2).sum().pow(0.5).item()
-                bnorm = self.B_syn[idx].weight.data.pow(2).sum().pow(0.5).item()
-                cos = self.B_syn[idx].weight.data.mul(self.synapses[idx+1].weight.data).sum().div(fnorm*bnorm)
-                angle = torch.acos(cos).item()*(180/(math.pi))
-                angles.append(angle)                
-        return angles
-
-
-    def Phi(self, x, y, neurons, beta, criterion, neurons_2=None):
-
-        mbs = x.size(0)       
-        conv_len = len(self.kernels)
-        tot_len = len(self.synapses)
-        bck_len = len(self.B_syn)
-
-        layers = [x] + neurons        
-        phis = []
-
-        if neurons_2 is None: #neurons 2 is not None only when computing the EP update for different updates between forward and backward
-            #Phi computation changes depending on softmax == True or not
-            if not self.softmax:
-
-                for idx in range(conv_len-1):    
-                    phi = torch.sum( self.pools[idx](self.synapses[idx](layers[idx])) * layers[idx+1], dim=(1,2,3)).squeeze()     
-                    phi += torch.sum( self.pools[idx+1](self.B_syn[idx](layers[idx+1])) * layers[idx+2], dim=(1,2,3)).squeeze()
-                    phis.append(phi)
-
-                phi = torch.sum( self.pools[conv_len-1](self.synapses[conv_len-1](layers[conv_len-1])) * layers[conv_len], dim=(1,2,3)).squeeze()
-                phi += torch.sum( self.B_syn[conv_len-1](layers[conv_len].view(mbs,-1)) * layers[conv_len+1], dim=1).squeeze()            
-                phis.append(phi)            
-
-                for idx in range(conv_len+1, tot_len-1):
-                    phi = torch.sum( self.synapses[idx](layers[idx].view(mbs,-1)) * layers[idx+1], dim=1).squeeze()
-                    phi += torch.sum( self.B_syn[idx](layers[idx+1].view(mbs,-1)) * layers[idx+2], dim=1).squeeze()             
-                    phis.append(phi)
-
-                phi = torch.sum( self.synapses[-1](layers[-2].view(mbs,-1)) * layers[-1], dim=1).squeeze()
-                if beta!=0.0:
-                    if criterion.__class__.__name__.find('MSE')!=-1:
-                        y = F.one_hot(y, num_classes=self.nc)
-                        L = 0.5*criterion(layers[-1].float(), y.float()).sum(dim=1).squeeze()   
-                    else:
-                        L = criterion(layers[-1].float(), y).squeeze()             
-                    phi -= beta*L
-                phis.append(phi)
-
-            else:
-                #the output layer used for the prediction is no longer part of the system ! Summing until len(self.synapses) - 1 only
-                for idx in range(conv_len-1):    
-                    phi = torch.sum( self.pools[idx](self.synapses[idx](layers[idx])) * layers[idx+1], dim=(1,2,3)).squeeze()     
-                    phi += torch.sum( self.pools[idx+1](self.B_syn[idx](layers[idx+1])) * layers[idx+2], dim=(1,2,3)).squeeze()
-                    phis.append(phi)
-            
-                phi = torch.sum( self.pools[conv_len-1](self.synapses[conv_len-1](layers[conv_len-1])) * layers[conv_len], dim=(1,2,3)).squeeze()
-                if bck_len>=conv_len:
-                    phi += torch.sum( self.B_syn[conv_len-1](layers[conv_len].view(mbs,-1)) * layers[conv_len+1], dim=1).squeeze()            
-                    phis.append(phi)            
-
-                    for idx in range(conv_len, tot_len-2):
-                        phi = torch.sum( self.synapses[idx](layers[idx].view(mbs,-1)) * layers[idx+1], dim=1).squeeze()
-                        phi += torch.sum( self.B_syn[idx](layers[idx+1].view(mbs,-1)) * layers[idx+2], dim=1).squeeze()             
-                        phis.append(phi)
-                    
-                    phi = torch.sum( self.synapses[-2](layers[-2].view(mbs,-1)) * layers[-1], dim=1).squeeze()
-                    if beta!=0.0:
-                        L = criterion(self.synapses[-1](layers[-1].view(mbs,-1)).float(), y).squeeze()             
-                        phi -= beta*L
-                    phis.append(phi)                    
-
-                #the prediction is made with softmax[last weights[penultimate layer]]
-                elif beta!=0.0:
-                    L = criterion(self.synapses[-1](layers[-1].view(mbs,-1)).float(), y).squeeze()             
-                    phi -= beta*L
-                    phis.append(phi)            
-                else:
-                    phis.append(phi)
-           
-        else:
-            layers_2 = [x] + neurons_2
-            #Phi computation changes depending on softmax == True or not
-            if not self.softmax:
-
-                for idx in range(conv_len-1):    
-                    phi = torch.sum( self.pools[idx](self.synapses[idx](layers[idx])) * layers_2[idx+1], dim=(1,2,3)).squeeze()     
-                    phi += torch.sum( self.pools[idx+1](self.B_syn[idx](layers_2[idx+1])) * layers[idx+2], dim=(1,2,3)).squeeze()
-                    phis.append(phi)
-
-                phi = torch.sum( self.pools[conv_len-1](self.synapses[conv_len-1](layers[conv_len-1])) * layers_2[conv_len], dim=(1,2,3)).squeeze()
-                phi += torch.sum( self.B_syn[conv_len-1](layers_2[conv_len].view(mbs,-1)) * layers[conv_len+1], dim=1).squeeze()            
-                phis.append(phi)            
-
-                for idx in range(conv_len+1, tot_len-1):
-                    phi = torch.sum( self.synapses[idx](layers[idx].view(mbs,-1)) * layers_2[idx+1], dim=1).squeeze()
-                    phi += torch.sum( self.B_syn[idx](layers_2[idx+1].view(mbs,-1)) * layers[idx+2], dim=1).squeeze()             
-                    phis.append(phi)
-
-                phi = torch.sum( self.synapses[-1](layers[-2].view(mbs,-1)) * layers_2[-1], dim=1).squeeze()
-                if beta!=0.0:
-                    if criterion.__class__.__name__.find('MSE')!=-1:
-                        y = F.one_hot(y, num_classes=self.nc)
-                        L = 0.5*criterion(layers_2[-1].float(), y.float()).sum(dim=1).squeeze()   
-                    else:
-                        L = criterion(layers_2[-1].float(), y).squeeze()             
-                    phi -= beta*L
-                phis.append(phi)
-
-            else:
-                #the output layer used for the prediction is no longer part of the system ! Summing until len(self.synapses) - 1 only
-                for idx in range(conv_len-1):    
-                    phi = torch.sum( self.pools[idx](self.synapses[idx](layers[idx])) * layers_2[idx+1], dim=(1,2,3)).squeeze()     
-                    phi += torch.sum( self.pools[idx+1](self.B_syn[idx](layers_2[idx+1])) * layers[idx+2], dim=(1,2,3)).squeeze()
-                    phis.append(phi)
-            
-                phi = torch.sum( self.pools[conv_len-1](self.synapses[conv_len-1](layers[conv_len-1])) * layers_2[conv_len], dim=(1,2,3)).squeeze()
-                if bck_len>=conv_len:
-                    phi += torch.sum( self.B_syn[conv_len-1](layers_2[conv_len].view(mbs,-1)) * layers[conv_len+1], dim=1).squeeze() 
-                    phis.append(phi)            
-
-                    for idx in range(conv_len, tot_len-2):
-                        phi = torch.sum( self.synapses[idx](layers[idx].view(mbs,-1)) * layers_2[idx+1], dim=1).squeeze()
-                        phi += torch.sum( self.B_syn[idx](layers_2[idx+1].view(mbs,-1)) * layers[idx+2], dim=1).squeeze()             
-                        phis.append(phi)
-                     
-                    phi = torch.sum( self.synapses[-2](layers[-2].view(mbs,-1)) * layers_2[-1], dim=1).squeeze()
-                    if beta!=0.0:
-                        L = criterion(self.synapses[-1](layers_2[-1].view(mbs,-1)).float(), y).squeeze()             
-                        phi -= beta*L
-                    phis.append(phi)                    
-
-                #the prediction is made with softmax[last weights[penultimate layer]]
-                elif beta!=0.0:
-                    L = criterion(self.synapses[-1](layers_2[-1].view(mbs,-1)).float(), y).squeeze()             
-                    phi -= beta*L                       
-                    phis.append(phi)
-                else:
-                    phis.append(phi)
-        return phis
-    
-
-    def forward(self, x, y, neurons, T, beta=0.0, criterion=torch.nn.MSELoss(reduction='none'), check_thm=False):
- 
-        not_mse = (criterion.__class__.__name__.find('MSE')==-1)
-        mbs = x.size(0)
-        device = x.device     
-        
-        if check_thm:
-            for t in range(T):
-                phis = self.Phi(x, y, neurons, beta, criterion)
-                for idx in range(len(neurons)-1):
-                    init_grad = torch.tensor([1 for i in range(mbs)], dtype=torch.float, device=device, requires_grad=True)
-                    grad = torch.autograd.grad(phis[idx], neurons[idx], grad_outputs=init_grad, create_graph=True)
-
-                    neurons[idx] = self.activation( grad[0] )
-                    neurons[idx].retain_grad()
-             
-                init_grad = torch.tensor([1 for i in range(mbs)], dtype=torch.float, device=device, requires_grad=True)
-                grad = torch.autograd.grad(phis[-1], neurons[-1], grad_outputs=init_grad, create_graph=True)
-                if not_mse and not(self.softmax):
-                    neurons[-1] = grad[0]
-                else:
-                    neurons[-1] = self.activation( grad[0] )
-
-                neurons[-1].retain_grad()
-        else:
-             for t in range(T):
-                phis = self.Phi(x, y, neurons, beta, criterion)
-                for idx in range(len(neurons)-1):
-                    init_grad = torch.tensor([1 for i in range(mbs)], dtype=torch.float, device=device, requires_grad=True)
-                    grad = torch.autograd.grad(phis[idx], neurons[idx], grad_outputs=init_grad, create_graph=False)
-
-                    neurons[idx] = self.activation( grad[0] )
-                    neurons[idx].requires_grad = True
-             
-                init_grad = torch.tensor([1 for i in range(mbs)], dtype=torch.float, device=device, requires_grad=False)
-                grad = torch.autograd.grad(phis[-1], neurons[-1], grad_outputs=init_grad, create_graph=False)
-                if not_mse and not(self.softmax):
-                    neurons[-1] = grad[0]
-                else:
-                    neurons[-1] = self.activation( grad[0] )
-
-                neurons[-1].requires_grad = True
-
-        return neurons
-       
-
-    def init_neurons(self, mbs, device):
-        
-        neurons = []
-        append = neurons.append
-        size = self.in_size
-        for idx in range(len(self.channels)-1): 
-            size = int( (size + 2*self.paddings[idx] - self.kernels[idx])/self.strides[idx] + 1 )  # size after conv
-            if self.pools[idx].__class__.__name__.find('Pool')!=-1:
-                size = int( (size - self.pools[idx].kernel_size)/self.pools[idx].stride + 1 )  # size after Pool
-            append(torch.zeros((mbs, self.channels[idx+1], size, size), requires_grad=True, device=device))
-
-        size = size * size * self.channels[-1]
-        
-        if not self.softmax:
-            for idx in range(len(self.fc)):
-                append(torch.zeros((mbs, self.fc[idx]), requires_grad=True, device=device))
-        else:
-            # we remove the output layer from the system
-            for idx in range(len(self.fc) - 1):
-                append(torch.zeros((mbs, self.fc[idx]), requires_grad=True, device=device))            
-            
-        return neurons
-
-    def compute_syn_grads(self, x, y, neurons_1, neurons_2, betas, criterion, check_thm=False, neurons_3=None):
-        
-        beta_1, beta_2 = betas
-        
-        self.zero_grad()            # p.grad is zero
-        if not(check_thm):
-            if neurons_3 is None: # neurons_3 is not None only when doing thirdphase with old VF (same update False) 
-                phis_1 = self.Phi(x, y, neurons_1, beta_1, criterion)   # phi will habe the form s_* W s_*
-            else:
-                phis_1 = self.Phi(x, y, neurons_1, beta_1, criterion, neurons_2=neurons_2) # phi will have the form s_* W s_beta
-        else:
-            phis_1 = self.Phi(x, y, neurons_1, beta_2, criterion)
-
-        if self.same_update:
-            phis_2 = self.Phi(x, y, neurons_2, beta_2, criterion)  # Phi = s_beta W s_beta
-        else:
-            if neurons_3 is None:
-                phis_2 = self.Phi(x, y, neurons_1, beta_2, criterion, neurons_2=neurons_2) # phi = s_* W s_beta
-            else:
-                phis_2 = self.Phi(x, y, neurons_1, beta_2, criterion, neurons_2=neurons_3) # phi = s_* W s_-beta
-                
-        for idx in range(len(neurons_1)):
-            phi_1 = phis_1[idx].mean()
-            phi_2 = phis_2[idx].mean()
-            delta_phi = ((phi_2 - phi_1)/(beta_1 - beta_2))        
-            delta_phi.backward() # p.grad = -(d_Phi_2/dp - d_Phi_1/dp)/(beta_2 - beta_1)
-        if self.same_update:
-            with torch.no_grad():
-                for idx in range(len(self.B_syn)):
-                    common_update = 0.5*(self.B_syn[idx].weight.grad.data + self.synapses[idx+1].weight.grad.data)
-                    self.B_syn[idx].weight.grad.data.copy_(common_update)
-                    self.synapses[idx+1].weight.grad.data.copy_(common_update)
        
 
          
