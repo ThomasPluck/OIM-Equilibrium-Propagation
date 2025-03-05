@@ -26,21 +26,10 @@ from model_utils import *
 ### HELPER FUNCTIONS ###
 
 def copy(neurons):
-    """
-    Create a deep copy of neurons that may contain tensors, lists, or tuples.
-    For tensors, copies the data and ensures requires_grad is True.
-    """
-    def _deep_copy_item(item):
-        if isinstance(item, torch.Tensor):
-            return torch.empty_like(item).copy_(item.data).requires_grad_()
-        elif isinstance(item, list):
-            return [_deep_copy_item(x) for x in item]
-        elif isinstance(item, tuple):
-            return tuple(_deep_copy_item(x) for x in item)
-        else:
-            return item
-    
-    return [_deep_copy_item(n) for n in neurons]
+    copy = []
+    for n in neurons:
+        copy.append(torch.empty_like(n).copy_(n.data).requires_grad_())
+    return copy
 
 
 
