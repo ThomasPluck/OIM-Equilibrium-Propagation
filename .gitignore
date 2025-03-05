@@ -8,3 +8,4 @@ mnist_pytorch/
 imagenet_samples/
 *.out
 EP-venv/
+wandb/

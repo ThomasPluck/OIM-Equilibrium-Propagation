@@ -14,13 +14,17 @@ import math
 
 
 
+
+
+
+
+### GENERAL DATA UTILS ###
+
+
 def asMinutes(s):
     m = math.floor(s / 60)
     s -= m * 60
     return '%dm %ds' % (m, s)
-
-
-
 
 
 def timeSince(since, percent):
@@ -31,6 +35,241 @@ def timeSince(since, percent):
     return 'elapsed time : %s \t (will finish in %s)' % (asMinutes(s), asMinutes(rs))
 
 
+
+
+### HYPERPARAMETERS FILE ###
+
+def createHyperparametersFile(path, args, model, command_line):
+    
+    hyperparameters = open(path + r"/hyperparameters.txt","w+")
+    # Maintain the same order as in the parser arguments
+    L = [
+        # WandB arguments
+        "- wandb project: {}".format(args.wandb_project) + "\n",
+        "- wandb entity: {}".format(args.wandb_entity) + "\n",
+        "- wandb name: {}".format(args.wandb_name) + "\n",
+        "- wandb group: {}".format(args.wandb_group) + "\n",
+        "- wandb mode: {}".format(args.wandb_mode) + "\n",
+        
+        # Model & task arguments
+        "- model: {}".format(args.model) + "\n",
+        "- activation: {}".format(args.act) + "\n",
+        "- task: {}".format(args.task) + "\n",
+        "- optimizer: {}".format(args.optim) + "\n",
+        "- loss: {}".format(args.loss) + "\n",
+        "- alg: {}".format(args.alg) + "\n",
+        "- thirdphase: {}".format(args.thirdphase) + "\n",
+        
+        # Execution arguments (commented out as they're not model hyperparameters)
+        # "- save: {}".format(args.save) + "\n", 
+        # "- todo: {}".format(args.todo) + "\n",
+        # "- load-path: {}".format(getattr(args, 'load_path', '')) + "\n",
+        
+        # Runtime parameters
+        "- seed: {}".format(args.seed) + "\n",
+        "- device: {}".format(args.device) + "\n",
+        
+        # Architecture parameters
+        "- architecture: {}".format(args.archi) + "\n",
+        "- weight learning rates: {}".format(args.weight_lrs) + "\n",
+        "- bias learning rates: {}".format(args.bias_lrs) + "\n",
+        "- sync learning rates: {}".format(args.sync_lrs) + "\n",
+        "- minibatch size: {}".format(args.mbs) + "\n",
+        "- T1: {}".format(args.T1) + "\n",
+        "- T2: {}".format(args.T2) + "\n", 
+        "- betas: {}".format(args.betas) + "\n", 
+        "- epochs: {}".format(args.epochs) + "\n", 
+        "- scale for weight init: {}".format(args.scale) + "\n",
+        "- epsilon: {}".format(args.epsilon) + "\n",
+        "- random phase initialisation: {}".format(args.random_phase_initialisation) + "\n",
+        "- reinitialise neurons: {}".format(args.reinitialise_neurons) + "\n",
+        "- N data train: {}".format(args.N_data_train) + "\n",
+        "- N data test: {}".format(args.N_data_test) + "\n",
+        "- input positive negative mapping: {}".format(args.input_positive_negative_mapping) + "\n",
+        "- debug: {}".format(args.debug) + "\n",
+        "- plot: {}".format(args.plot) + "\n",
+        
+        # Training options
+        "- weight decays: {}".format(args.wds) + "\n",
+        "- learning rate decay: {}".format(args.lr_decay) + "\n",
+        "- momentum (if sgd): {}".format(args.mmt) + "\n",
+
+        
+        "- check theorem: {}".format(args.check_thm) + "\n",
+        "- random beta_2 sign: {}".format(args.random_sign) + "\n", 
+        "- data augmentation (if CIFAR10): {}".format(args.data_aug) + "\n",
+        "- softmax: {}".format(args.softmax) + "\n", 
+        "- cep debug: {}".format(args.cep_debug) + "\n",
+        
+        # Commented out CNN parameters
+        # "- pools: {}".format(getattr(args, 'pools', '')) + "\n",
+        # "- channels: {}".format(getattr(args, 'channels', [])) + "\n",
+        # "- kernels: {}".format(getattr(args, 'kernels', [])) + "\n", 
+        # "- strides: {}".format(getattr(args, 'strides', [])) + "\n",
+        # "- paddings: {}".format(getattr(args, 'paddings', [])) + "\n",
+        # "- fc: {}".format(getattr(args, 'fc', [])) + "\n",
+    ]
+
+    print(command_line, '\n', file=hyperparameters)   
+    hyperparameters.writelines(L)
+    if hasattr(model, 'pools'):
+        print('\nPoolings :', model.pools, '\n', file=hyperparameters)
+    else:
+        print('\n', file=hyperparameters)
+    print(model, file=hyperparameters)
+
+    hyperparameters.close()
+
+
+
+
+
+
+### DATASET GENERATION UTILS ###
+
+class PositiveNegativeRangeNormalize:
+    """Transform that maps values from [0,1] to [-1,1] range"""
+    def __call__(self, x):
+        return 2.0 * x - 1.0
+
+    def __repr__(self):
+        return self.__class__.__name__ + '()'
+
+def generate_mnist(args):
+    '''
+    Generate mnist dataloaders
+    If input_positive_negative_remapping is True, remaps pixel values from [0,1] to [-1,1]
+    '''
+
+    # Use custom training and test data size
+    N_data_train = args.N_data_train
+    N_data_test = args.N_data_test
+    N_class = 10
+    
+    if args.input_positive_negative_mapping:
+        transform = torchvision.transforms.Compose([
+            torchvision.transforms.ToTensor(),
+            torchvision.transforms.Normalize(mean=(0.0,), std=(1.0,)), # Since ToTensor already maps [0,255] to [0,1] this line should be redundant
+            PositiveNegativeRangeNormalize()
+        ])
+    else:
+        transform = torchvision.transforms.Compose([
+            torchvision.transforms.ToTensor(),
+            torchvision.transforms.Normalize(mean=(0.0,), std=(1.0,)) # Since ToTensor already maps [0,255] to [0,1] this line should be redundant
+        ])
+
+    # TODO maybe add data augmentation here like in Laydevant if needed
+
+
+    # Training data
+    mnist_dset_train = torchvision.datasets.MNIST('./mnist_pytorch', train=True, transform=transform, target_transform=None, download=True)
+    # Reduce training dataset size to N_data_train points, but keep the same number of data points per class
+    indices = []
+    comp = torch.zeros(N_class)
+    for idx, target in enumerate(mnist_dset_train.targets):
+        if comp[target] < N_data_train / N_class:
+            indices.append(idx)
+            comp[target] += 1
+        if len(indices) == N_data_train:
+            break
+
+    mnist_dset_train.data = mnist_dset_train.data[indices]
+    mnist_dset_train.targets = mnist_dset_train.targets[indices]
+
+
+    # Testing data
+    mnist_dset_test = torchvision.datasets.MNIST('./mnist_pytorch', train=False, transform=transform, target_transform=None, download=True)
+    # Reduce test dataset size, but keep the same number of data points per class
+    indices = []
+    comp = torch.zeros(N_class)
+    for idx, target in enumerate(mnist_dset_test.targets):
+        if comp[target] < N_data_test / N_class:
+            indices.append(idx)
+            comp[target] += 1
+        if len(indices) == N_data_test:
+            break
+
+    mnist_dset_test.data = mnist_dset_test.data[indices]
+    mnist_dset_test.targets = mnist_dset_test.targets[indices]
+
+
+    # Create the data loaders
+    train_loader = torch.utils.data.DataLoader(mnist_dset_train, batch_size=args.mbs, shuffle=True, num_workers=0)
+    test_loader = torch.utils.data.DataLoader(mnist_dset_test, batch_size=200, shuffle=False, num_workers=0)
+
+
+    if args.debug:
+        # Verify data ranges
+        for batch, _ in train_loader:
+            print(f"Data range verification:")
+            print(f"Min pixel value: {batch.min():.4f}")
+            print(f"Max pixel value: {batch.max():.4f}")
+
+            break
+
+        # Verify data size
+        print(f"Train data size: {len(mnist_dset_train)}")
+        print(f"Test data size: {len(mnist_dset_test)}")
+
+    return train_loader, test_loader
+
+
+
+
+
+
+
+
+### PLOT FUNCTIONS ###
+
+
+def plot_neural_activity(neurons, path):   
+    N = len(neurons)
+    fig = plt.figure(figsize=(3*N,6))
+    for idx in range(N):
+        fig.add_subplot(2, N//2+1, idx+1)
+        nrn = neurons[idx].cpu().detach().numpy().flatten()
+        plt.hist(nrn, 50)
+        plt.title('neurons of layer '+str(idx+1))
+    fig.savefig(path + '/neural_activity.png')
+    plt.close()
+
+
+def plot_acc(train_acc, test_acc, path):
+    fig = plt.figure(figsize=(16,9))
+    x_axis = [i for i in range(len(train_acc))]
+    plt.plot(x_axis, train_acc, label='train')
+    plt.plot(x_axis, test_acc, label='test')
+    plt.xlabel('Epochs')
+    plt.ylabel('Accuracy')
+    plt.legend()
+    plt.grid()
+    fig.savefig(path + '/train-test_acc.png')
+    plt.close()
+
+
+def plot_loss(train_loss, test_loss, path):
+    fig = plt.figure(figsize=(16,9))
+    x_axis = [i for i in range(len(train_loss))]
+    plt.plot(x_axis, train_loss, label='train')
+    plt.plot(x_axis, test_loss, label='test')
+    plt.xlabel('Epochs')
+    plt.ylabel('Loss')
+    plt.legend()
+    plt.grid()
+    fig.savefig(path + '/train-test_loss.png')
+    plt.close()
+
+
+
+
+
+### TODO READ BELOW ###
+
+
+
+
+### GDU CHECK UTILS ###
 def get_estimate(dic):
     estimates = {}
     for key in dic.keys():
@@ -127,95 +366,6 @@ def plot_gdu(BPTT, EP, path, EP_2=None, alg='EP'):
         plt.ylabel('gradient estimate')
         fig.savefig(path+'/'+key.replace('.','_')+'.png', dpi=300)
         plt.close()
-
-
-
-        
-def plot_neural_activity(neurons, path):   
-    N = len(neurons)
-    fig = plt.figure(figsize=(3*N,6))
-    for idx in range(N):
-        fig.add_subplot(2, N//2+1, idx+1)
-        nrn = neurons[idx].cpu().detach().numpy().flatten()
-        plt.hist(nrn, 50)
-        plt.title('neurons of layer '+str(idx+1))
-    fig.savefig(path + '/neural_activity.png')
-    plt.close()
-
-
-
-
-    
-def plot_synapses(model, path):   
-    N = len(model.synapses)
-    fig = plt.figure(figsize=(4*N,3))
-    for idx in range(N):
-        fig.add_subplot(1, N, idx+1)
-        nrn = model.synapses[idx].weight.cpu().detach().numpy().flatten()
-        plt.hist(nrn, 50)
-        plt.title('synapses of layer '+str(idx+1))
-    fig.savefig(path)
-    plt.close()
-
-
-
-
-
-def plot_acc(train_acc, test_acc, path):
-    fig = plt.figure(figsize=(16,9))
-    x_axis = [i for i in range(len(train_acc))]
-    plt.plot(x_axis, train_acc, label='train')
-    plt.plot(x_axis, test_acc, label='test')
-    plt.xlabel('Epochs')
-    plt.ylabel('Accuracy')
-    plt.legend()
-    plt.grid()
-    fig.savefig(path + '/train-test_acc.png')
-    plt.close()
- 
-
-
-def createHyperparametersFile(path, args, model, command_line):
-    
-    hyperparameters = open(path + r"/hyperparameters.txt","w+")
-    L = ["- task: {}".format(args.task) + "\n",
-        "- data augmentation (if CIFAR10): {}".format(args.data_aug) + "\n",
-        "- learning rate decay: {}".format(args.lr_decay) + "\n",
-        "- scale for weight init: {}".format(args.scale) + "\n",
-        "- activation: {}".format(args.act) + "\n",
-        "- learning rates: {}".format(args.lrs) + "\n",
-        "- weight decays: {}".format(args.wds) + "\n",
-        "- momentum (if sgd): {}".format(args.mmt) + "\n",
-        "- optimizer: {}".format(args.optim) + "\n",
-        "- loss: {}".format(args.loss) + "\n",
-        "- alg: {}".format(args.alg) + "\n",
-        "- minibatch size: {}".format(args.mbs) + "\n",
-        "- T1: {}".format(args.T1) + "\n",
-        "- T2: {}".format(args.T2) + "\n", 
-        "- betas: {}".format(args.betas) + "\n", 
-        "- random beta_2 sign: {}".format(args.random_sign) + "\n", 
-        "- thirdphase: {}".format(args.thirdphase) + "\n", 
-        "- softmax: {}".format(args.softmax) + "\n", 
-        "- same update VFCNN: {}".format(args.same_update) + "\n", 
-        "- epochs: {}".format(args.epochs) + "\n", 
-        "- seed: {}".format(args.seed) + "\n", 
-        "- device: {}".format(args.device) + "\n"]
-
-    print(command_line, '\n', file=hyperparameters)   
-    hyperparameters.writelines(L)
-    if hasattr(model, 'pools'):
-        print('\nPoolings :', model.pools, '\n', file=hyperparameters)
-    else:
-        print('\n')
-    print(model, file=hyperparameters)
-
-    hyperparameters.close()
-
-
-
-
-
-
 
 
  
