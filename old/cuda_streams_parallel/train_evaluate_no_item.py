@@ -54,9 +54,10 @@ def train_minibatch(model, optimizer, data, targets, args, criterion, epoch_idx=
     ### SETUP ###
     # Dictionary to store outputs and metrics
     result = {
-        'correct': 0,
+        'correct_tensor': None, # MODIFIED: Return tensor
         'total': 0,
-        'loss': 0.0,
+        'batch_loss_tensor': None, # MODIFIED: Return tensor
+        'batch_size': 0, # MODIFIED: Return size separately
         'network_metrics': None,
         'gradient_metrics': None,
         'convergence_metrics': {},
@@ -223,7 +224,8 @@ def train_minibatch(model, optimizer, data, targets, args, criterion, epoch_idx=
         ### PREDICTION AND ACCURACY ###
         # Use the output for prediction
         pred = torch.argmax(model_output, dim=1).squeeze()
-        result['correct'] = (targets == pred).sum().item()
+        # result['correct'] = (targets == pred).sum().item() # MODIFIED: Defer .item()
+        result['correct_tensor'] = (targets == pred).sum() # RETURN TENSOR
         result['total'] = targets.size(0)
         
         ### LOSS CALCULATION ###
@@ -240,7 +242,9 @@ def train_minibatch(model, optimizer, data, targets, args, criterion, epoch_idx=
             else: # i.e. apply extra linear layer to the output layer of neurons (only for CNN models)
                 batch_loss = criterion(model.synapses[-1](model_output.view(data.size(0),-1)).float(), targets).mean().squeeze()
         
-        result['loss'] = batch_loss.item() * targets.size(0)  # Accumulate weighted by batch size
+        # result['loss'] = batch_loss.item() * targets.size(0)  # MODIFIED: Defer .item()
+        result['batch_loss_tensor'] = batch_loss # RETURN TENSOR
+        result['batch_size'] = targets.size(0) # Need size separately
         
     
     ### ADDITIONAL METRICS ###
@@ -256,7 +260,7 @@ def train_minibatch(model, optimizer, data, targets, args, criterion, epoch_idx=
 
 
 
-def train(model, optimizer, train_loader, test_loader, args, device, criterion, checkpoint=None, scheduler=None, wandb_run=None, save_metrics_callback=None):
+def train(model, optimizer, train_loader, test_loader, args, device, criterion, checkpoint=None, scheduler=None):
     """Train the model using Equilibrium Propagation.
     
     Args:
@@ -269,9 +273,6 @@ def train(model, optimizer, train_loader, test_loader, args, device, criterion, 
         criterion: Loss function to use
         checkpoint: Optional checkpoint to resume training from
         scheduler: Learning rate scheduler (optional)
-        wandb_run: Optional wandb run object for logging (if None, will use global wandb)
-        save_metrics_callback: Optional callback function for saving metrics during training
-                              Function signature: save_metrics_callback(metrics_dict, epoch)
     """
     
     mbs = train_loader.batch_size
@@ -317,39 +318,19 @@ def train(model, optimizer, train_loader, test_loader, args, device, criterion, 
                     'gradient_metrics': result['gradient_metrics']
                 }
             
-            # Update metrics
-            run_correct += result['correct']
+            # Update metrics (Note: This uses .item() as it's the non-parallel train function)
+            run_correct += result['correct_tensor'].item()
             run_total += result['total']
-            run_loss += result['loss']
+            run_loss += result['batch_loss_tensor'].item() * result['batch_size']
             
             # Print progress
             if ((batch_idx%(iter_per_epochs//10)==0) or (batch_idx==iter_per_epochs-1)):
                 train_acc_current = run_correct/run_total
                 avg_loss = run_loss/run_total
-                current_epoch = epoch_sofar+epoch+(batch_idx/iter_per_epochs)
-                print('##### Epoch :', round(current_epoch, 2), ' #####',
+                print('##### Epoch :', round(epoch_sofar+epoch+(batch_idx/iter_per_epochs), 2), ' #####',
                      '\tRun acc :', round(train_acc_current,3),'\t('+str(run_correct)+'/'+str(run_total)+')\t',
                      '\tRun loss:', round(avg_loss,3),
                      timeSince(start, ((batch_idx+1)+(epoch_sofar+epoch)*iter_per_epochs)/((epoch_sofar+args.epochs)*iter_per_epochs)))
-                
-                # Log current training metrics to wandb if enabled
-                if args.save:
-                    current_metrics = {
-                        "current_train/accuracy": 100*train_acc_current,
-                        "current_train/loss": avg_loss,
-                        "epoch": current_epoch
-                    }
-                    
-                    if args.wandb_mode != "disabled":
-                        # Use the provided wandb_run if available, otherwise use global wandb
-                        if wandb_run is not None:
-                            wandb_run.log(current_metrics)
-                        else:
-                            wandb.log(current_metrics)
-                        
-                    # Call the save_metrics_callback if provided
-                    if save_metrics_callback is not None:
-                        save_metrics_callback(current_metrics, current_epoch)
                 
                 # Print metrics if debug is enabled
                 if args.debug and batch_idx == 0:
@@ -396,24 +377,14 @@ def train(model, optimizer, train_loader, test_loader, args, device, criterion, 
                     error_dict = RMSE(BPTT, EP)
                     
                     # Log RMSE and sign error results to wandb if enabled
-                    if args.save:
+                    if args.wandb_mode != "disabled":
                         wandb_metrics = {}
                         for key, metrics in error_dict.items():
                             # Format the parameter name for wandb logging
                             param_name = key.replace('.', '_')
                             wandb_metrics[f'gdu_check/{param_name}/rmse'] = metrics['rmse']
                             wandb_metrics[f'gdu_check/{param_name}/sign_error'] = metrics['sign_error']
-                        
-
-                        # Use the provided wandb_run if available, otherwise use global wandb
-                        if args.wandb_mode != "disabled" and wandb_run is not None:
-                            wandb_run.log(wandb_metrics)
-                        else:
-                            wandb.log(wandb_metrics)
-                            
-                        # Call the save_metrics_callback if provided
-                        if save_metrics_callback is not None:
-                            save_metrics_callback(wandb_metrics, epoch_sofar+epoch)
+                        wandb.log(wandb_metrics)
                 
                 # Plot neural activity if enabled
                 if args.plot and args.save:
@@ -445,25 +416,14 @@ def train(model, optimizer, train_loader, test_loader, args, device, criterion, 
                 print("### ###\n")
             
             # Log test phase metrics to wandb if enabled
-            if args.save:
+            if args.wandb_mode != "disabled":
                 # Log convergence metrics
-                test_metrics = {}
                 for key, value in test_phase_convergence_metrics.items():
-                    test_metrics[f"convergence/test/{key}"] = value
+                    wandb.log({f"test/convergence/{key}": value})
                 
                 # Log binarization metrics
                 for key, value in test_phase_binarization_metrics.items():
-                    test_metrics[f"binarization/test/{key}"] = value
-                
-                # Use the provided wandb_run if available, otherwise use global wandb
-                if args.wandb_mode != "disabled" and wandb_run is not None:
-                    wandb_run.log(test_metrics)
-                else:
-                    wandb.log(test_metrics)
-                    
-                # Call the save_metrics_callback if provided
-                if save_metrics_callback is not None:
-                    save_metrics_callback(test_metrics, epoch_sofar+epoch)
+                    wandb.log({f"test/binarization/{key}": value})
         
         # Calculate train metrics for this epoch
         train_acc_current = run_correct/run_total
@@ -499,52 +459,31 @@ def train(model, optimizer, train_loader, test_loader, args, device, criterion, 
             all_binarization_metrics.update(test_phase_binarization_metrics)
             
             # Log combined metrics to wandb if enabled
-            if args.save:
-                wandb_combined_metrics = {}
+            if args.wandb_mode != "disabled":
                 # Log all metrics to wandb
                 for key, value in all_convergence_metrics.items():
-                    wandb_combined_metrics[f"convergence/{key}"] = value
+                    wandb.log({f"convergence/{key}": value})
                 
                 for key, value in all_binarization_metrics.items():
-                    wandb_combined_metrics[f"binarization/{key}"] = value
+                    wandb.log({f"binarization/{key}": value})
                 
                 if network_metrics:
                     for key, value in network_metrics.items():
-                        wandb_combined_metrics[f"network/{key}"] = value
+                        wandb.log({f"network/{key}": value})
                 
                 if gradient_metrics:
                     for key, value in gradient_metrics.items():
-                        wandb_combined_metrics[f"gradient/{key}"] = value
-                
-                # Use the provided wandb_run if available, otherwise use global wandb
-                if args.wandb_mode != "disabled" and wandb_run is not None:
-                    wandb_run.log(wandb_combined_metrics)
-                else:
-                    wandb.log(wandb_combined_metrics)
-                    
-                # Call the save_metrics_callback if provided
-                if save_metrics_callback is not None:
-                    save_metrics_callback(wandb_combined_metrics, epoch_sofar+epoch)
+                        wandb.log({f"gradient/{key}": value})
         
         # Log metrics to wandb if enabled
-        if args.save:
-            epoch_metrics = {
+        if args.wandb_mode != "disabled":
+            wandb.log({
                 "train/accuracy": 100*train_acc_current,
                 "test/accuracy": 100*test_acc_current,
                 "train/loss": train_loss_current,
                 "test/loss": test_loss_current,
                 "epoch": epoch_sofar+epoch+1
-            }
-            
-            # Use the provided wandb_run if available, otherwise use global wandb
-            if args.wandb_mode != "disabled" and wandb_run is not None:
-                wandb_run.log(epoch_metrics)
-            else:
-                wandb.log(epoch_metrics)
-                
-            # Call the save_metrics_callback if provided
-            if save_metrics_callback is not None:
-                save_metrics_callback(epoch_metrics, epoch_sofar+epoch)
+            })
         
         # Save best model
         if args.save:
@@ -573,8 +512,7 @@ def train(model, optimizer, train_loader, test_loader, args, device, criterion, 
         save_dic['scheduler'] = scheduler.state_dict() if scheduler is not None else None
         torch.save(save_dic,  args.path + '/final_checkpoint.tar')
         torch.save(model, args.path + '/final_model.pt')
-    
-    return train_acc, test_acc, train_loss, test_loss
+ 
 
 
 
@@ -590,12 +528,7 @@ def train(model, optimizer, train_loader, test_loader, args, device, criterion, 
 
 
 
-
-
-
-
-
-
+ 
 
             
 def evaluate(model, loader, T, device, plot=False, return_velocities=False, criterion=None, noise_level=0.0):
@@ -619,7 +552,11 @@ def evaluate(model, loader, T, device, plot=False, return_velocities=False, crit
     
     # Store neurons for metrics calculation
     final_neurons = None
-    
+    # Store intermediate tensor results
+    correct_tensors = []
+    batch_loss_tensors = []
+    batch_sizes = []
+
     for idx, (x, y) in enumerate(loader):
         x, y = x.to(device), y.to(device)
         neurons = model.init_neurons(x.size(0), device)
@@ -651,8 +588,9 @@ def evaluate(model, loader, T, device, plot=False, return_velocities=False, crit
             
         # Use the output for prediction
         pred = torch.argmax(model_output, dim=1).squeeze()
-        correct += (y == pred).sum().item()
-        
+        # correct += (y == pred).sum().item() # MODIFIED: Accumulate tensors
+        correct_tensors.append((y == pred).sum())
+
         # Calculate loss if criterion is provided
         with torch.no_grad():
             if criterion.__class__.__name__.find('MSE')!=-1: # i.e. if the loss is MSE
@@ -667,11 +605,18 @@ def evaluate(model, loader, T, device, plot=False, return_velocities=False, crit
                     batch_loss = criterion(model_output.float(), y).mean().squeeze()
                 else: # i.e. apply extra linear layer to the output layer of neurons (only for CNN models)
                     batch_loss = criterion(model.synapses[-1](model_output.view(x.size(0),-1)).float(), y).mean().squeeze()
-            total_loss += batch_loss.item() * x.size(0)  # Accumulate weighted by batch size
+            # total_loss += batch_loss.item() * x.size(0)  # MODIFIED: Accumulate tensors & size
+            batch_loss_tensors.append(batch_loss)
+            batch_sizes.append(x.size(0))
 
-    acc = correct/len(loader.dataset) 
+
+    # Aggregate results after the loop
+    correct = torch.stack(correct_tensors).sum().item()
+    total_loss = sum([(loss * size).item() for loss, size in zip(batch_loss_tensors, batch_sizes)])
+
+    acc = correct/len(loader.dataset)
     avg_loss = total_loss/len(loader.dataset) if criterion is not None else None
-    
+
     print(phase+' accuracy :\t', acc)
     print(phase+' loss :\t', avg_loss)
     

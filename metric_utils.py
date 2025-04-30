@@ -143,6 +143,14 @@ def get_convergence_metrics(velocities, phase_type="free"):
     Returns:
         Dictionary of convergence metrics organized by phase_type
     """
+    # Handle the case where velocities is None
+    if velocities is None:
+        # Return default metrics
+        return {phase_type: {
+            "max_velocity": 0.0,
+            "mean_velocity": 0.0,
+            "rms_velocity": 0.0
+        }}
     
     # Convert list of tensors to a single numpy array
     all_velocities = []

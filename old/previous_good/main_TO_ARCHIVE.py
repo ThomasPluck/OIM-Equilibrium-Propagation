@@ -1,19 +1,12 @@
 import torch
-import matplotlib.pyplot as plt
-import numpy as np
-import torchvision
-import torch.nn.functional as F
 import argparse
 import matplotlib
 matplotlib.use('Agg') # Use Agg backend for headless operation
 import wandb
 
-import glob 
-from PIL import Image 
 import os 
 from datetime import datetime
 import time
-import math
 import sys
 
 from model_utils import *
@@ -21,57 +14,73 @@ from data_utils import *
 from metric_utils import *
 from train_evaluate import *
 
+
 ### ARGUMENTS ###
 
 parser = argparse.ArgumentParser(description='Eqprop')
 
-parser.add_argument('--wandb_project', type=str, default='oim-eq-prop', help='WandB project name')
+parser.add_argument('--wandb_project', type=str, default='Equilibrium-Propagation', help='WandB project name')
 parser.add_argument('--wandb_entity', type=str, default='alexgower-team', help='WandB entity/username')
 parser.add_argument('--wandb_name', type=str, default=None, help='WandB run name')
 parser.add_argument('--wandb_group', type=str, default=None, help='WandB group name for organizing related runs')
 parser.add_argument('--wandb_mode', type=str, default='disabled', help='WandB mode (online/offline/disabled)')
+parser.add_argument('--wandb_id', type=str, default=None, help='WandB run ID for continuing a crashed run')
 
 parser.add_argument('--model',type = str, default = 'MLP', metavar = 'm', help='model e.g. MLP, OIM_MLP, CNN') 
 parser.add_argument('--act',type = str, default = 'cos', metavar = 'a', help='activation function, their default was mysig')
 parser.add_argument('--task',type = str, default = 'MNIST', metavar = 't', help='task')
 parser.add_argument('--optim', type = str, default = 'sgd', metavar = 'opt', help='optimizer for training')
-parser.add_argument('--loss', type = str, default = 'mse', metavar = 'lss', help='loss for training')
-parser.add_argument('--alg', type = str, default = 'EP', metavar = 'al', help='EP or BPTT or CEP') # TODO think about CEP later
+parser.add_argument('--loss', type = str, default = 'mse', metavar = 'lss', help='loss for tr aining')
+parser.add_argument('--alg', type = str, default = 'EP', metavar = 'al', help='EP or BPTT')
 parser.add_argument('--thirdphase', default = False, action = 'store_true', help='add third phase for higher order evaluation of the gradient (default: False)')
 parser.add_argument('--save', default = False, action = 'store_true', help='saving results')
 parser.add_argument('--todo', type = str, default = 'train', metavar = 'tr', help='training or plot gdu curves or evaluate')
 parser.add_argument('--load-path', type = str, default = '', metavar = 'l', help='load a model')
-parser.add_argument('--seed',type = int, default = None, metavar = 's', help='random seed')
+parser.add_argument('--seed',type = int, default = 42, metavar = 's', help='random seed')
 parser.add_argument('--device',type = int, default = 0, metavar = 'd', help='device')
+
+
+parser.add_argument('--T1',type = int, default = 20, metavar = 'T1', help='Time of first phase')
+parser.add_argument('--T2',type = int, default = 4, metavar = 'T2', help='Time of second phase (and third phase if applicable)')
+parser.add_argument('--betas', nargs='+', type = float, default = [0.0, 0.01], metavar = 'Bs', help='Betas in first and second (and third if applicable) phase')
+parser.add_argument('--epsilon', type=float, default=0.1, help='Step size for OIM dynamics (default=0.1)')
+parser.add_argument('--noise_level', type=float, default=0.0, help='Noise level for phase dynamics (default=0.0)')
+parser.add_argument('--N_data_train', type=int, default=1000, help='Number of training data points (default: 1000)')
+parser.add_argument('--N_data_test', type=int, default=100, help='Number of test data points (default: 100)')
+
 
 parser.add_argument('--archi', nargs='+', type = int, default = [784, 512, 10], metavar = 'A', help='architecture of the network')
 parser.add_argument('--weight_lrs', nargs='+', type = float, default = [], metavar = 'l', help='layer wise lr')
 parser.add_argument('--bias_lrs', nargs='+', type = float, default = [], metavar = 'bl', help='layer wise lr for biases (only applies to OIM models)')
 parser.add_argument('--sync_lrs', nargs='+', type = float, default = [], metavar = 'sl', help='layer wise lr for sync parameters (only applies to OIM models)')
-parser.add_argument('--mbs',type = int, default = 20, metavar = 'M', help='minibatch size')
-parser.add_argument('--T1',type = int, default = 20, metavar = 'T1', help='Time of first phase')
-parser.add_argument('--T2',type = int, default = 4, metavar = 'T2', help='Time of second phase (and third phase if applicable)')
-parser.add_argument('--betas', nargs='+', type = float, default = [0.0, 0.01], metavar = 'Bs', help='Betas in first and second (and third if applicable) phase')
 parser.add_argument('--epochs',type = int, default = 1, metavar = 'EPT',help='Number of epochs per tasks')
-parser.add_argument('--scale',type = float, default = None, metavar = 'g', help='scal factor for weight init')
-parser.add_argument('--epsilon', type=float, default=0.1, help='Step size for OIM dynamics (default=0.1)')
-parser.add_argument('--random_phase_initialisation', default=False, action='store_true', help='Initialize phases randomly between 0 and 2π (default: False)')
-parser.add_argument('--reinitialise_neurons', default=False, action='store_true', help='Reinitialize neurons before second phase (and third if applicable) (default: False)')
-parser.add_argument('--N_data_train', type=int, default=1000, help='Number of training data points (default: 1000)')
-parser.add_argument('--N_data_test', type=int, default=100, help='Number of test data points (default: 100)')
-parser.add_argument('--input_positive_negative_mapping', default=False, action='store_true', help='Remap input pixel values from [0,1] to [-1,1] (default: False)')
-parser.add_argument('--debug', default=False, action='store_true', help='Debug mode (default: False)')
-parser.add_argument('--plot', default = False, action = 'store_true', help='Enable plotting of phase dynamics during training and evaluation')
+parser.add_argument('--weight_scale', nargs='+', type=float, default=None, metavar='wg', help='scale factors for weight init (single float or list per layer)')
+parser.add_argument('--bias_scale', nargs='+', type=float, default=None, metavar='bg', help='scale factors for bias init (single float or list per layer, defaults to weight_scale)')
+parser.add_argument('--mbs',type = int, default = 20, metavar = 'M', help='minibatch size')
 
+parser.add_argument('--plot', default = False, action = 'store_true', help='Enable plotting of phase dynamics during training and evaluation')
+parser.add_argument('--debug', default=False, action='store_true', help='Debug mode (default: False)')
+parser.add_argument('--check-thm', default = False, action = 'store_true', help='checking the gdu while training')
+
+parser.add_argument('--mmt',type = float, default = 0.0, metavar = 'mmt', help='Momentum for sgd')
 parser.add_argument('--wds', nargs='+', type = float, default = None, metavar = 'l', help='layer weight decays')
 parser.add_argument('--lr-decay', default = False, action = 'store_true', help='enabling learning rate decay')
-parser.add_argument('--mmt',type = float, default = 0.0, metavar = 'mmt', help='Momentum for sgd')
 
-parser.add_argument('--check-thm', default = False, action = 'store_true', help='checking the gdu while training')
+parser.add_argument('--random_phase_initialisation', default=False, action='store_true', help='Initialize phases randomly between 0 and 2π (default: False)')
+parser.add_argument('--intralayer_connections', default=False, action='store_true', help='Add trainable synaptic connections within each hidden layer (default: False)')
+parser.add_argument('--reinitialise_neurons', default=False, action='store_true', help='Reinitialize neurons before second phase (and third if applicable) (default: False)')
+parser.add_argument('--input_positive_negative_mapping', default=False, action='store_true', help='Remap input pixel values from [0,1] to [-1,1] (default: False)')
 parser.add_argument('--random-sign', default = False, action = 'store_true', help='randomly switch beta_2 sign')
 parser.add_argument('--data-aug', default = False, action = 'store_true', help='enabling data augmentation for cifar10')
 parser.add_argument('--softmax', default = False, action = 'store_true', help='softmax loss with parameters (default: False)')
-parser.add_argument('--cep-debug', default = False, action = 'store_true', help='debug cep')
+
+# Quantization parameters for physical system modeling
+parser.add_argument('--quantisation_bits', type=int, default=0, help='Number of bits for parameter quantization (0 means no quantization)')
+parser.add_argument('--J_max', type=float, default=1.0, help='Maximum absolute value for synaptic weights')
+parser.add_argument('--h_max', type=float, default=1.0, help='Maximum absolute value for bias parameters')
+parser.add_argument('--sync_max', type=float, default=1.0, help='Maximum absolute value for synchronization parameters')
+parser.add_argument('--float64', default=False, action='store_true', help='Use 64-bit float precision instead of default 32-bit')
+
 
 # parser.add_argument('--pools', type = str, default = 'mm', metavar = 'p', help='pooling') 
 # parser.add_argument('--channels', nargs='+', type = int, default = [32, 64], metavar = 'C', help='channels of the convnet')
@@ -91,6 +100,15 @@ print('\nargs\tmbs\tT1\tT2\tepochs\tactivation\tbetas')
 print('\t',args.mbs,'\t',args.T1,'\t',args.T2,'\t',args.epochs,'\t',args.act, '\t', args.betas)
 print('\n')
 
+# Set precision based on args.float64
+if args.float64:
+    torch.set_default_dtype(torch.float64)
+    print('Using 64-bit floating point precision')
+else:
+    print('Using default 32-bit floating point precision')
+
+# Print default dtype (either 32-bit or 64-bit based on args.float64)
+print('Default dtype :\t', torch.get_default_dtype(), '\n')
 
 # Initialize wandb if not disabled
 if args.wandb_mode != 'disabled':
@@ -100,7 +118,9 @@ if args.wandb_mode != 'disabled':
         name=args.wandb_name,
         group=args.wandb_group,
         config=vars(args),
-        mode=args.wandb_mode
+        mode=args.wandb_mode,
+        resume="allow",
+        id=args.wandb_id
     )
 
 
@@ -132,11 +152,6 @@ if args.save:
 else:
     path = ''
 args.path = path
-
-# Set default dtype
-#if args.alg=='CEP' and args.cep_debug:
-#    torch.set_default_dtype(torch.float64)
-print('Default dtype :\t', torch.get_default_dtype(), '\n')
 
 # Set seed
 if args.seed is not None:
@@ -212,7 +227,9 @@ if args.load_path=='': # i.e. if no model is loaded
             activation = torch.cos
 
 
-        model = OIM_MLP(args.archi, epsilon=args.epsilon, random_phase_initialisation=args.random_phase_initialisation, activation=activation, path=args.path)
+        model = OIM_MLP(args.archi, epsilon=args.epsilon, random_phase_initialisation=args.random_phase_initialisation, 
+                        activation=activation, path=args.path, intralayer_connections=args.intralayer_connections,
+                        quantisation_bits=args.quantisation_bits, J_max=args.J_max, h_max=args.h_max, sync_max=args.sync_max)
 
     elif args.model=='MLP':
 
@@ -230,7 +247,7 @@ if args.load_path=='': # i.e. if no model is loaded
         elif args.act=='ctrd_hard_sig':
             activation = ctrd_hard_sig
 
-        model = P_MLP(args.archi, activation=activation, path=args.path)  # P_MLP means MLP defined using primitive function
+        model = P_MLP(args.archi, activation=activation, path=args.path, intralayer_connections=args.intralayer_connections)
 
 
     # elif args.model.find('CNN')!=-1:
@@ -241,6 +258,7 @@ if args.load_path=='': # i.e. if no model is loaded
     #         if args.model=='CNN':
     #             model = P_CNN(28, channels, args.kernels, args.strides, args.fc, pools, args.paddings, 
     #                               activation=activation, softmax=args.softmax)
+
 
 
     #     elif args.task=='CIFAR10':    
@@ -262,15 +280,23 @@ if args.load_path=='': # i.e. if no model is loaded
 
 
 
-    # Do weight initialization scaling if specified
-    if args.scale is not None:
-        model.apply(my_init(args.scale))
+    # Do weight and bias initialization scaling if specified
+    if args.weight_scale is not None:
+        model.apply(my_init(args.weight_scale, args.bias_scale))
 
 
 
 else: # i.e. if a model is loaded
 
-    model = torch.load(args.load_path + '/model.pt', map_location=device)
+    model = torch.load(args.load_path + '/model.pt', map_location=device, weights_only=False)
+    
+    # Update model.path to match the current load_path # TODO check this is needed
+    if hasattr(model, 'path') and model.path != args.load_path:
+        print(f"Updating model path from '{model.path}' to '{args.load_path}'")
+        model.path = args.load_path
+    
+    # Also update args.path to match the load_path
+    args.path = args.load_path
 
 model.to(device)
 print(model)
@@ -301,35 +327,56 @@ if args.todo=='train':
     optim_params = []
 
 
-    # if (args.alg=='CEP' and args.wds) and not(args.cep_debug):
-    #     for idx in range(len(model.synapses)):
-    #         args.wds[idx] = (1 - (1 - args.wds[idx] * 0.1 )**(1/args.T2))/args.weight_lrs[idx]
-
     for idx in range(len(model.synapses)):
+        # Get learning rate, defaulting to last one if index is out of range
+        lr = args.weight_lrs[idx] if idx < len(args.weight_lrs) else args.weight_lrs[-1]
+        
         if args.wds is None:
-            optim_params.append(  {'params': model.synapses[idx].parameters(), 'lr': args.weight_lrs[idx]}  )
+            optim_params.append({'params': model.synapses[idx].parameters(), 'lr': lr})
         else:
-            optim_params.append(  {'params': model.synapses[idx].parameters(), 'lr': args.weight_lrs[idx], 'weight_decay': args.wds[idx]}  ) # Note weight and biases for same layer get same weight decay
+            # Get weight decay, defaulting to last one if index is out of range
+            wd = args.wds[idx] if idx < len(args.wds) else args.wds[-1]
+            optim_params.append({'params': model.synapses[idx].parameters(), 'lr': lr, 'weight_decay': wd})
 
+    # Add intralayer synapses to the optimizer if they exist
+    if hasattr(model, 'intralayer_connections') and model.intralayer_connections:
+        for idx, synapse in enumerate(model.intralayer_synapses):
+            # Get learning rate, defaulting to last one if index is out of range
+            lr = args.weight_lrs[idx] if idx < len(args.weight_lrs) else args.weight_lrs[-1]
+            
+            if args.wds is None:
+                optim_params.append({'params': synapse.parameters(), 'lr': lr})
+            else:
+                # Get weight decay, defaulting to last one if index is out of range
+                wd = args.wds[idx] if idx < len(args.wds) else args.wds[-1]
+                optim_params.append({'params': synapse.parameters(), 'lr': lr, 'weight_decay': wd})
             
     # Add bias and sync parameters to the optimizer (for OIM_MLP model)
     if args.model == 'OIM_MLP':
         # Add bias parameters with custom learning rates if provided
         for idx, bias in enumerate(model.biases):
-            lr = args.bias_lrs[idx] 
+            # Get learning rate, defaulting to last one if index is out of range
+            lr = args.bias_lrs[idx] if idx < len(args.bias_lrs) else args.bias_lrs[-1]
+            
             if args.wds is None:
                 optim_params.append({'params': [bias], 'lr': lr})
             else:
-                optim_params.append({'params': [bias], 'lr': lr, 'weight_decay': args.wds[idx]})
+                # Get weight decay, defaulting to last one if index is out of range
+                wd = args.wds[idx] if idx < len(args.wds) else args.wds[-1]
+                optim_params.append({'params': [bias], 'lr': lr, 'weight_decay': wd})
 
         
         # Add sync parameters with custom learning rates if provided
         for idx, sync in enumerate(model.syncs):
-            lr = args.sync_lrs[idx]
+            # Get learning rate, defaulting to last one if index is out of range
+            lr = args.sync_lrs[idx] if idx < len(args.sync_lrs) else args.sync_lrs[-1]
+            
             if args.wds is None:
                 optim_params.append({'params': [sync], 'lr': lr})
             else:
-                optim_params.append({'params': [sync], 'lr': lr, 'weight_decay': args.wds[idx]})
+                # Get weight decay, defaulting to last one if index is out of range
+                wd = args.wds[idx] if idx < len(args.wds) else args.wds[-1]
+                optim_params.append({'params': [sync], 'lr': lr, 'weight_decay': wd})
 
 
     if args.optim=='sgd':
@@ -339,13 +386,20 @@ if args.todo=='train':
 
     ## ##
 
+
+
+
+
     ## Constructing the Scheduler ##
     if args.lr_decay:
         #scheduler = torch.optim.lr_scheduler.MultiStepLR(optimizer, milestones=[40,80,120], gamma=0.1)
-        scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, 100, eta_min=1e-5)
+        scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, 100, eta_min=1e-5) # Over 100 epoch cycle, and to 1e-5 minimum
     else:
         scheduler = None
     ## ##
+
+
+    
 
     ## Loading the State ##
     if args.load_path!='': # i.e. if a model is loaded
@@ -423,9 +477,10 @@ elif args.todo=='gducheck':
     RMSE(BPTT, EP) # Print RMSE and sign error between EP and BPTT
 
     if args.save:
-        
+
+        # Get estimate does INTEGRATION of (instantaneous) WEIGHT GRADIENTS up to each time step  get actual weight update at end of nudged phase for EP / end of all BPTT backward steps
         bptt_est = get_estimate(BPTT) 
-        ep_est = get_estimate(EP)
+        ep_est = get_estimate(EP) 
         torch.save(bptt_est, path+'/bptt.tar')
         torch.save(BPTT, path+'/BPTT.tar')
         torch.save(ep_est, path+'/ep.tar') 
@@ -436,12 +491,16 @@ elif args.todo=='gducheck':
             torch.save(ep_2_est, path+'/ep_2.tar')
             torch.save(EP_2, path+'/EP_2.tar')
         
-            compare_estimate(bptt_est, ep_est, ep_2_est, path)
+            # Do symmetric EP v one-sided EP comparison bar chart
+            compare_estimate(bptt_est, ep_est, ep_2_est, path) 
         
+            # Plot GDU curves (i.e. INTEGRATED instantaneous gradient estimates against time steps)
             plot_gdu(BPTT, EP, path, EP_2=EP_2, alg=args.alg)
+            plot_gdu_instantaneous(BPTT, EP, args, EP_2=EP_2, path=path)
         else:
+            # Plot GDU curves (i.e. INTEGRATED instantaneous gradient estimates against time steps)
             plot_gdu(BPTT, EP, path, alg=args.alg)
-
+            plot_gdu_instantaneous(BPTT, EP, args, path=path)
     ## ##
 
 ### ###
@@ -458,12 +517,12 @@ elif args.todo=='gducheck':
 
 elif args.todo=='evaluate':
 
-    training_correct, training_loss, _ = evaluate(model, train_loader, args.T1, device, plot=args.plot, criterion=criterion)
+    training_correct, training_loss, _ = evaluate(model, train_loader, args.T1, device, plot=args.plot, criterion=criterion, noise_level=args.noise_level)
     training_acc = training_correct / len(train_loader.dataset)
     print('\nTrain accuracy :', round(training_acc,2), file=open(path+'/hyperparameters.txt', 'a'))
     print('\nTrain loss :', round(training_loss,4), file=open(path+'/hyperparameters.txt', 'a'))
     
-    test_correct, test_loss, _ = evaluate(model, test_loader, args.T1, device, plot=args.plot, criterion=criterion)
+    test_correct, test_loss, _ = evaluate(model, test_loader, args.T1, device, plot=args.plot, criterion=criterion, noise_level=args.noise_level)
     test_acc = test_correct / len(test_loader.dataset)
     print('\nTest accuracy :', round(test_acc, 2), file=open(path+'/hyperparameters.txt', 'a'))
     print('\nTest loss :', round(test_loss,4), file=open(path+'/hyperparameters.txt', 'a'))
