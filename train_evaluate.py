@@ -340,12 +340,9 @@ def train(model, optimizer, train_loader, test_loader, args, device, criterion, 
                         "epoch": current_epoch
                     }
                     
-                    if args.wandb_mode != "disabled":
-                        # Use the provided wandb_run if available, otherwise use global wandb
-                        if wandb_run is not None:
-                            wandb_run.log(current_metrics)
-                        else:
-                            wandb.log(current_metrics)
+                    # Only log to wandb if both enabled and wandb_run is available
+                    if args.wandb_mode != "disabled" and wandb_run is not None:
+                        wandb_run.log(current_metrics)
                         
                     # Call the save_metrics_callback if provided
                     if save_metrics_callback is not None:
@@ -404,12 +401,9 @@ def train(model, optimizer, train_loader, test_loader, args, device, criterion, 
                             wandb_metrics[f'gdu_check/{param_name}/rmse'] = metrics['rmse']
                             wandb_metrics[f'gdu_check/{param_name}/sign_error'] = metrics['sign_error']
                         
-
-                        # Use the provided wandb_run if available, otherwise use global wandb
+                        # Only log to wandb if both enabled and wandb_run is available
                         if args.wandb_mode != "disabled" and wandb_run is not None:
                             wandb_run.log(wandb_metrics)
-                        else:
-                            wandb.log(wandb_metrics)
                             
                         # Call the save_metrics_callback if provided
                         if save_metrics_callback is not None:
@@ -455,11 +449,9 @@ def train(model, optimizer, train_loader, test_loader, args, device, criterion, 
                 for key, value in test_phase_binarization_metrics.items():
                     test_metrics[f"binarization/test/{key}"] = value
                 
-                # Use the provided wandb_run if available, otherwise use global wandb
+                # Only log to wandb if both enabled and wandb_run is available
                 if args.wandb_mode != "disabled" and wandb_run is not None:
                     wandb_run.log(test_metrics)
-                else:
-                    wandb.log(test_metrics)
                     
                 # Call the save_metrics_callback if provided
                 if save_metrics_callback is not None:
@@ -516,11 +508,9 @@ def train(model, optimizer, train_loader, test_loader, args, device, criterion, 
                     for key, value in gradient_metrics.items():
                         wandb_combined_metrics[f"gradient/{key}"] = value
                 
-                # Use the provided wandb_run if available, otherwise use global wandb
+                # Only log to wandb if both enabled and wandb_run is available
                 if args.wandb_mode != "disabled" and wandb_run is not None:
                     wandb_run.log(wandb_combined_metrics)
-                else:
-                    wandb.log(wandb_combined_metrics)
                     
                 # Call the save_metrics_callback if provided
                 if save_metrics_callback is not None:
@@ -536,11 +526,9 @@ def train(model, optimizer, train_loader, test_loader, args, device, criterion, 
                 "epoch": epoch_sofar+epoch+1
             }
             
-            # Use the provided wandb_run if available, otherwise use global wandb
+            # Only log to wandb if both enabled and wandb_run is available
             if args.wandb_mode != "disabled" and wandb_run is not None:
                 wandb_run.log(epoch_metrics)
-            else:
-                wandb.log(epoch_metrics)
                 
             # Call the save_metrics_callback if provided
             if save_metrics_callback is not None:
