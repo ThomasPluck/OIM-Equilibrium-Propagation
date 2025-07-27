@@ -309,8 +309,24 @@ class ModelTrainer:
         # Remember that args.path is model specific save path to save files
         # (args.load_path is overarching path to resume training from in this case)
         # so here we are just using args.load_path as boolean to check if we should load a model
-        checkpoint_path = f"{self.args.path}/checkpoint.tar"
-        model_path = f"{self.args.path}/model.pt"
+        
+        # Choose which checkpoint to load based on args.load_checkpoint
+        if self.args.load_checkpoint == 'best':
+            checkpoint_path = f"{self.args.path}/checkpoint.tar"
+            model_path = f"{self.args.path}/model.pt"
+            print(f"Loading best checkpoint from {checkpoint_path}")
+        elif self.args.load_checkpoint == 'final':
+            checkpoint_path = f"{self.args.path}/final_checkpoint.tar"
+            model_path = f"{self.args.path}/final_model.pt"
+            print(f"Loading final checkpoint from {checkpoint_path}")
+        else:
+            raise ValueError(f"Invalid load_checkpoint value: {self.args.load_checkpoint}. Must be 'best' or 'final'.")
+
+        # Check if the requested files exist
+        if not os.path.exists(checkpoint_path):
+            raise FileNotFoundError(f"Checkpoint file not found: {checkpoint_path}")
+        if not os.path.exists(model_path):
+            raise FileNotFoundError(f"Model file not found: {model_path}")
 
         ### LOAD MODEL ###
         model = torch.load(model_path, map_location=self.device, weights_only=False)
@@ -431,6 +447,8 @@ class ModelTrainer:
         """
         if self.args.task == 'MNIST':
             train_loader, test_loader = generate_mnist(self.args)
+        elif self.args.task == 'FashionMNIST':
+            train_loader, test_loader = generate_fashion_mnist(self.args)
         else:
             raise ValueError(f"Task {self.args.task} not supported")
             

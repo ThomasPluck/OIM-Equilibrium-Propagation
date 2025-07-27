@@ -117,6 +117,56 @@ def my_init(weight_scales, bias_scales=None):
 
 
 
+### NEURON QUANTIZATION ###
+def quantize_neural_states(neural_states, model, neural_quantisation_bits):
+    """
+    Quantize neural states (phases for OIM, activations for P_MLP) to finite precision.
+    
+    Parameters:
+    - neural_states: List of neural state tensors
+    - model: The model instance to determine quantization type
+    - neural_quantisation_bits: Number of bits for quantization (0 means no quantization)
+    
+    Returns:
+    - List of quantized neural state tensors
+    """
+    if neural_quantisation_bits <= 0:
+        return neural_states
+    
+    quantized_states = []
+    num_levels = 2 ** neural_quantisation_bits - 1
+    
+    for states in neural_states:
+        if isinstance(model, OIM_MLP):
+            # OIM model - quantize phases in [0, 2π) range
+            # Normalize to [0, 2π) range first
+            normalized_states = torch.fmod(states, 2 * math.pi)
+            normalized_states = torch.where(normalized_states < 0, normalized_states + 2 * math.pi, normalized_states)
+            
+            # Quantize
+            step_size = 2 * math.pi / num_levels
+            quantized = torch.round(normalized_states / step_size) * step_size
+            
+            # Ensure we stay in [0, 2π) range
+            quantized = torch.fmod(quantized, 2 * math.pi)
+        else:
+            # P_MLP model - quantize activations in [-1, 1] range
+            # Clamp to [-1, 1] range
+            clamped_states = torch.clamp(states, -1.0, 1.0)
+            
+            # Quantize
+            step_size = 2.0 / num_levels
+            quantized = torch.round((clamped_states + 1.0) / step_size) * step_size - 1.0
+            
+            # Ensure we stay in [-1, 1] range
+            quantized = torch.clamp(quantized, -1.0, 1.0)
+        
+        # Preserve gradients
+        quantized.requires_grad_(states.requires_grad)
+        quantized_states.append(quantized)
+    
+    return quantized_states
+### ###
 
 
 
@@ -526,7 +576,8 @@ class OIM_MLP(torch.nn.Module):
                     plot=True,  # Enable plotting
                     phase_type=f"{phase_type}_high_velocity",  # Mark as high velocity case
                     return_velocities=False,  # No need to return velocities
-                    plot_idx=problem_batch_idx  # Plot the problematic batch element
+                    plot_idx=problem_batch_idx,  # Plot the problematic batch element
+                    noise_level=noise_level  # Pass through the original noise level
                 )
 
             ### ###
@@ -1187,3 +1238,4 @@ class P_MLP(torch.nn.Module):
         
 #         delta_phi = (phi_2 - phi_1)/(beta_1 - beta_2)        
 #         delta_phi.backward() # p.grad = -(d_Phi_2/dp - d_Phi_1/dp)/(beta_2 - beta_1) ----> dL/dp  by the theorem
+

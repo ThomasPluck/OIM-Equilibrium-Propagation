@@ -168,6 +168,95 @@ def generate_mnist(args):
     return train_loader, test_loader
 
 
+def generate_fashion_mnist(args):
+    '''
+    Generate Fashion-MNIST dataloaders
+    If input_positive_negative_remapping is True, remaps pixel values from [0,1] to [-1,1]
+    '''
+
+    # Use custom training and test data size
+    N_data_train = args.N_data_train
+    N_data_test = args.N_data_test
+    N_class = 10
+    
+    if args.input_positive_negative_mapping:
+        transform = torchvision.transforms.Compose([
+            torchvision.transforms.ToTensor(),
+            torchvision.transforms.Normalize(mean=(0.0,), std=(1.0,)), # Since ToTensor already maps [0,255] to [0,1] this line should be redundant
+            PositiveNegativeRangeNormalize()
+        ])
+    else:
+        transform = torchvision.transforms.Compose([
+            torchvision.transforms.ToTensor(),
+            torchvision.transforms.Normalize(mean=(0.0,), std=(1.0,)) # Since ToTensor already maps [0,255] to [0,1] this line should be redundant
+        ])
+
+    # TODO maybe add data augmentation here like in Laydevant if needed
+
+
+    # Training data
+    fashion_mnist_dset_train = torchvision.datasets.FashionMNIST('./fashion_mnist_pytorch', train=True, transform=transform, target_transform=None, download=True)
+    
+    # If requesting exact full dataset size, skip the subsampling
+    use_full_train = (N_data_train == 60000)
+    use_full_test = (N_data_test == 10000)
+    
+    if not use_full_train:
+        # Reduce training dataset size to N_data_train points, but keep the same number of data points per class
+        indices = []
+        comp = torch.zeros(N_class)
+        for idx, target in enumerate(fashion_mnist_dset_train.targets):
+            if comp[target] < N_data_train / N_class:
+                indices.append(idx)
+                comp[target] += 1
+            if len(indices) == N_data_train:
+                break
+
+        fashion_mnist_dset_train.data = fashion_mnist_dset_train.data[indices]
+        fashion_mnist_dset_train.targets = fashion_mnist_dset_train.targets[indices]
+
+
+    # Testing data
+    fashion_mnist_dset_test = torchvision.datasets.FashionMNIST('./fashion_mnist_pytorch', train=False, transform=transform, target_transform=None, download=True)
+    
+    if not use_full_test:
+        # Reduce test dataset size, but keep the same number of data points per class
+        indices = []
+        comp = torch.zeros(N_class)
+        for idx, target in enumerate(fashion_mnist_dset_test.targets):
+            if comp[target] < N_data_test / N_class:
+                indices.append(idx)
+                comp[target] += 1
+            if len(indices) == N_data_test:
+                break
+
+        fashion_mnist_dset_test.data = fashion_mnist_dset_test.data[indices]
+        fashion_mnist_dset_test.targets = fashion_mnist_dset_test.targets[indices]
+
+
+    # Create the data loaders
+    # Use multiple workers for asynchronous data loading
+    print(f"Using num_workers={args.num_workers} for Fashion-MNIST DataLoaders.")
+    train_loader = torch.utils.data.DataLoader(fashion_mnist_dset_train, batch_size=args.mbs, shuffle=True, num_workers=args.num_workers, persistent_workers=True, pin_memory=True)
+    test_loader = torch.utils.data.DataLoader(fashion_mnist_dset_test, batch_size=200, shuffle=False, num_workers=args.num_workers, persistent_workers=True, pin_memory=True)
+
+
+    if args.debug:
+        # Verify data ranges
+        for batch, _ in train_loader:
+            print(f"Fashion-MNIST data range verification:")
+            print(f"Min pixel value: {batch.min():.4f}")
+            print(f"Max pixel value: {batch.max():.4f}")
+
+            break
+
+        # Verify data size
+        print(f"Fashion-MNIST train data size: {len(fashion_mnist_dset_train)}")
+        print(f"Fashion-MNIST test data size: {len(fashion_mnist_dset_test)}")
+
+    return train_loader, test_loader
+
+
 
 
 

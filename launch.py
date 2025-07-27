@@ -29,7 +29,7 @@ def get_args():
      
     parser.add_argument('--model',type = str, default = 'MLP', metavar = 'm', help='model e.g. MLP, OIM_MLP, CNN') 
     parser.add_argument('--act',type = str, default = 'cos', metavar = 'a', help='activation function, their default was mysig') 
-    parser.add_argument('--task',type = str, default = 'MNIST', metavar = 't', help='task')
+    parser.add_argument('--task',type = str, default = 'MNIST', metavar = 't', help='task (MNIST or FashionMNIST)')
     parser.add_argument('--optim', type = str, default = 'sgd', metavar = 'opt', help='optimizer for training')
     parser.add_argument('--loss', type = str, default = 'mse', metavar = 'lss', help='loss for training')
     parser.add_argument('--alg', type = str, default = 'EP', metavar = 'al', help='EP or BPTT')
@@ -37,6 +37,7 @@ def get_args():
     parser.add_argument('--save', default = False, action = 'store_true', help='saving results')
     parser.add_argument('--todo', type=str, default='train', help='training task - always train for multiprocessing')
     parser.add_argument('--load-path', type = str, default = '', metavar = 'l', help='load a model')
+    parser.add_argument('--load-checkpoint', type = str, default = 'final', choices=['final', 'best'], metavar = 'lc', help='which checkpoint to load: "final" (most recent) or "best" (highest test accuracy)')
     parser.add_argument('--device',type = int, default = 0, metavar = 'd', help='device')
     
     parser.add_argument('--T1', type=int, default=20, metavar = 'T1', help='Time of first phase')
@@ -75,6 +76,7 @@ def get_args():
     
     # Quantization parameters for physical system modeling
     parser.add_argument('--quantisation-bits', type=int, default=0, help='Number of bits for parameter quantization (0 means no quantization)')
+    parser.add_argument('--neuron-quantisation-bits', type=int, default=0, help='Number of bits for neural state quantization (0 means no quantization)')
     parser.add_argument('--J-max', type=float, default=1.0, help='Maximum absolute value for synaptic weights')
     parser.add_argument('--h-max', type=float, default=1.0, help='Maximum absolute value for bias parameters')
     parser.add_argument('--sync-max', type=float, default=1.0, help='Maximum absolute value for synchronization parameters')

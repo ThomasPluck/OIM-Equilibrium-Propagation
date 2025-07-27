@@ -94,6 +94,10 @@ def train_minibatch(model, optimizer, data, targets, args, criterion, epoch_idx=
         
         neurons_1 = copy(neurons)
         
+        ### Determine whether to quantise neurons ###
+        if args.neuron_quantisation_bits > 0:
+            neurons_1 = quantize_neural_states(neurons_1, model, args.neuron_quantisation_bits)
+        
         ### NUDGED/POSITIVE PHASE ###
         if args.random_sign and (beta_1 == 0.0):
             rnd_sgn = 2 * np.random.randint(2) - 1
@@ -102,6 +106,8 @@ def train_minibatch(model, optimizer, data, targets, args, criterion, epoch_idx=
         # Determine if should reinitialize neurons
         if args.reinitialise_neurons:
             neurons = model.init_neurons(data.size(0), device)
+        else:
+            neurons = copy(neurons_1)
         
         # Run nudged phase with or without velocity tracking
         neurons, velocities_positive = model(data, targets, neurons, args.T2, 
@@ -116,6 +122,10 @@ def train_minibatch(model, optimizer, data, targets, args, criterion, epoch_idx=
             result['binarization_metrics']['positive'] = get_binarization_metrics(model, neurons, phase_type="positive")
         
         neurons_2 = copy(neurons)
+        
+        ### Determine whether to quantise neurons ###
+        if args.neuron_quantisation_bits > 0:
+            neurons_2 = quantize_neural_states(neurons_2, model, args.neuron_quantisation_bits)
         
         ### OPTIONAL THIRD PHASE = NUDGED/NEGATIVE PHASE ###
         if args.thirdphase:
@@ -139,6 +149,10 @@ def train_minibatch(model, optimizer, data, targets, args, criterion, epoch_idx=
                 result['binarization_metrics']['negative'] = get_binarization_metrics(model, neurons, phase_type="negative")
             
             neurons_3 = copy(neurons)
+            
+            ### Determine whether to quantise neurons ###
+            if args.neuron_quantisation_bits > 0:
+                neurons_3 = quantize_neural_states(neurons_3, model, args.neuron_quantisation_bits)
             
             ### GRADIENT COMPUTATION ###
             # Compute parameter gradients with three phases
@@ -340,6 +354,8 @@ def train(model, optimizer, train_loader, test_loader, args, device, criterion, 
                         "epoch": current_epoch
                     }
                     
+                    if args.wandb_mode != "disabled" and wandb_run is not None:
+                        wandb_run.log(current_metrics)
                     # Only log to wandb if both enabled and wandb_run is available
                     if args.wandb_mode != "disabled" and wandb_run is not None:
                         wandb_run.log(current_metrics)
@@ -401,7 +417,8 @@ def train(model, optimizer, train_loader, test_loader, args, device, criterion, 
                             wandb_metrics[f'gdu_check/{param_name}/rmse'] = metrics['rmse']
                             wandb_metrics[f'gdu_check/{param_name}/sign_error'] = metrics['sign_error']
                         
-                        # Only log to wandb if both enabled and wandb_run is available
+
+                        # Use the provided wandb_run if available
                         if args.wandb_mode != "disabled" and wandb_run is not None:
                             wandb_run.log(wandb_metrics)
                             
@@ -449,7 +466,7 @@ def train(model, optimizer, train_loader, test_loader, args, device, criterion, 
                 for key, value in test_phase_binarization_metrics.items():
                     test_metrics[f"binarization/test/{key}"] = value
                 
-                # Only log to wandb if both enabled and wandb_run is available
+                # Use the provided wandb_run if available
                 if args.wandb_mode != "disabled" and wandb_run is not None:
                     wandb_run.log(test_metrics)
                     
@@ -508,7 +525,7 @@ def train(model, optimizer, train_loader, test_loader, args, device, criterion, 
                     for key, value in gradient_metrics.items():
                         wandb_combined_metrics[f"gradient/{key}"] = value
                 
-                # Only log to wandb if both enabled and wandb_run is available
+                # Use the provided wandb_run if available
                 if args.wandb_mode != "disabled" and wandb_run is not None:
                     wandb_run.log(wandb_combined_metrics)
                     
@@ -526,7 +543,7 @@ def train(model, optimizer, train_loader, test_loader, args, device, criterion, 
                 "epoch": epoch_sofar+epoch+1
             }
             
-            # Only log to wandb if both enabled and wandb_run is available
+            # Use the provided wandb_run if available
             if args.wandb_mode != "disabled" and wandb_run is not None:
                 wandb_run.log(epoch_metrics)
                 
@@ -549,18 +566,23 @@ def train(model, optimizer, train_loader, test_loader, args, device, criterion, 
                 save_dic['scheduler'] = scheduler.state_dict() if scheduler is not None else None
                 torch.save(save_dic,  args.path + '/checkpoint.tar')
                 torch.save(model, args.path + '/model.pt')
+            
+            # Save final checkpoint after every epoch (for crash recovery)
+            print(f"Saving final checkpoint after epoch {epoch_sofar+epoch+1} to {args.path}")
+            final_save_dic = {'model_state_dict': model.state_dict(), 'opt': optimizer.state_dict(),
+                            'train_acc': train_acc, 'test_acc': test_acc, 
+                            'best': best, 'epoch': epoch_sofar+epoch+1,
+                            'train_loss': train_loss, 'test_loss': test_loss}
+            final_save_dic['scheduler'] = scheduler.state_dict() if scheduler is not None else None
+            torch.save(final_save_dic, args.path + '/final_checkpoint.tar')
+            torch.save(model, args.path + '/final_model.pt')
+            print(f"Final checkpoint saved successfully")
+            
             plot_acc(train_acc, test_acc, args.path)
             plot_loss(train_loss, test_loss, args.path)
 
-    ### SAVING FINAL MODEL
-    if args.save:
-        save_dic = {'model_state_dict': model.state_dict(), 'opt': optimizer.state_dict(),
-                    'train_acc': train_acc, 'test_acc': test_acc, 
-                    'best': best, 'epoch': args.epochs,
-                    'train_loss': train_loss, 'test_loss': test_loss}
-        save_dic['scheduler'] = scheduler.state_dict() if scheduler is not None else None
-        torch.save(save_dic,  args.path + '/final_checkpoint.tar')
-        torch.save(model, args.path + '/final_model.pt')
+    ### FINAL MODEL ALREADY SAVED AFTER EACH EPOCH
+    # Final checkpoint is now saved after every epoch for crash recovery
     
     return train_acc, test_acc, train_loss, test_loss
 
