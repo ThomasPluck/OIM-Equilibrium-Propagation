@@ -740,14 +740,1163 @@ class OIM_MLP(torch.nn.Module):
 
 ### ###
 
+class SL_MLP(torch.nn.Module):
+    def __init__(self, archi, activation=lambda x : x, epsilon=0.1, random_phase_initialisation=False, path=None,
+                 intralayer_connections=None, quantisation_bits=0, J_max=1.0, h_max=1.0, sync_max=None):
+        """
+        Initialize an Oscillator Ising Machine Multi-Layer Perceptron.
+        
+        Parameters:
+        - archi: List defining the architecture [input_size, hidden_size_1, ..., output_size]
+        - activation: Activation function to use (default: torch.Ident)
+        - epsilon: Step size for OIM dynamics (default: 0.1)
+        - random_phase_initialisation: Whether to initialize phases randomly (default: False)
+        - path: Path where plot images will be saved (default: None)
+        - intralayer_connections: Whether to include trainable synaptic connections within each hidden layer (default: False)
+        - quantisation_bits: Number of bits for parameter quantization (0 means no quantization)
+        - J_max: Maximum absolute value for synaptic weights
+        - h_max: Maximum absolute value for bias parameters
+        - sync_max: Maximum absolute value for synchronization parameters
+        """
+        super(SL_MLP, self).__init__()
+        
+        self.archi = archi
+        self.n_layers = len(archi) - 1
+        self.activation = activation
+        self.epsilon = epsilon
+        self.random_phase_initialisation = random_phase_initialisation
+        self.path = path  # Store path for saving plots
+        
+        # Store quantization parameters
+        self.quantisation_bits = quantisation_bits
+        self.J_max = J_max
+        self.h_max = h_max
+        
+        self.nc = self.archi[-1]  # Number of classes equals the last layer size
+        
+        self.softmax = False  # For compatibility with original code (Softmax readout is only defined for CNN and VFCNN)
+        
+        # Initialize synaptic weights between layers (J parameters in energy function)
+        self.synapses = torch.nn.ModuleList()
+        for idx in range(len(archi)-1):
+            self.synapses.append(torch.nn.Linear(archi[idx], archi[idx+1], bias=False)) # Set bias to False as OIM do not use simple linear bias
+        
+        # Initialize biases (h parameters in energy function)
+        self.biases = torch.nn.ParameterList()
+        for idx in range(1, len(archi)): # Start from 1 as we do not have a bias for the input layer
+            self.biases.append(torch.nn.Parameter(torch.zeros(archi[idx]))) # Initialize biases to zero
+            
+        # Apply quantization after initialization if needed
+        if self.quantisation_bits > 0:
+            self.quantize_parameters()
+
+    def quantize_parameters(self):
+        """
+        Quantize all model parameters based on quantisation_bits and max values.
+        This function applies both value clamping and quantization to synaptic weights, biases, 
+        and sync parameters, but only when quantisation_bits > 0.
+        """
+        # Skip if quantization is disabled
+        if self.quantisation_bits <= 0:
+            return
+        
+        # Calculate quantization step sizes based on bits and max values
+        J_levels = 2 ** self.quantisation_bits - 1
+        h_levels = 2 ** self.quantisation_bits - 1
+        # sync_levels = 2 ** self.quantisation_bits - 1
+        
+        J_step = 2 * self.J_max / J_levels
+        h_step = 2 * self.h_max / h_levels
+        # sync_step = 2 * self.sync_max / sync_levels
+        
+        # Quantize synaptic weights
+        for synapse in self.synapses:
+            # Clip weights to [-J_max, J_max]
+            synapse.weight.data.clamp_(-self.J_max, self.J_max)
+            # Quantize to discrete levels
+            synapse.weight.data = torch.round(synapse.weight.data / J_step) * J_step
+        
+        # Quantize intralayer synaptic weights if enabled
+        if self.intralayer_connections:
+            for synapse in self.intralayer_synapses:
+                synapse.weight.data.clamp_(-self.J_max, self.J_max)
+                synapse.weight.data = torch.round(synapse.weight.data / J_step) * J_step
+        
+        # Quantize biases
+        for bias in self.biases:
+            bias.data.clamp_(-self.h_max, self.h_max)
+            bias.data = torch.round(bias.data / h_step) * h_step
+
+    def total_energy(self, x: torch.Tensor, phases : torch.Tensor, beta=0.0, y=None, criterion=None):
+        """
+        Compute the OIM 'total' energy function, F:
+
+        F = E_OIM + beta * L, 
+        - for loss function L
+        - for OIM energy funcition E_OIM = E^J_OIM + E^h_OIM + E^K_s_OIM
+        
+        OIM dynamics are given by dφ_i/dt = -δF/δφ_i (i.e. the gradient of the energy function with respect to the PHASES) in both free (beta=0) and nudged (beta != 0) phases
+        - They are computed here by automatic differentiation framework 
+
+        Parameters:
+        - x: Input data [batch_size, input_dim]
+        - phases: List of phase variables for each layer EXCLUDING the input layer (which are always clamped)
+        - beta: Nudging factor for the loss
+        - y: Target labels (optional)
+        - criterion: Loss function (optional)
+        """
+        
+        x = x.type(torch.complex128)
+
+        batch_size = x.size(0)
+        device = x.device
+        energy = torch.zeros(batch_size, device=device) # i.e. we want a separate energy for each batch element so we can calculate energy gradient descent dynamics for each batch element independently
+        
+        # Flatten input
+        x_flat = x.view(batch_size, -1)
+        energy_J_input = -torch.sum(((x_flat.unsqueeze(2) - phases[0].unsqueeze(1)).abs()**2) * self.synapses[0].weight.T, dim=(1,2))  # Shape: [batch_size]
+        
+        # Weight energy
+        # -∑_{k=1}^{N_L-1} ∑_{i∈L_k, j∈L_{k+1}} J^(k)_{ij} |φ_i - φ_j|^2
+        energy_J = torch.zeros(batch_size, device=device) # i.e. we want a separate energy for each batch element
+        for k in range(1, len(phases)):  # k starts at 1 (second hidden layer) and goes up to len(phases)-1 (which is the index of the output layer) but we incorporate weights 'from behind'
+            # Process entire batch at once
+            phi_k = phases[k-1].unsqueeze(2)    # Shape: [batch_size, layer_k_size, 1] # phases[k-1] is layer k
+            phi_k_plus_1 = phases[k].unsqueeze(1)     # Shape: [batch_size, 1, layer_k+1_size] # phases[k] is layer k+1
+            phase_diffs = (phi_k - phi_k_plus_1).abs()**2       # Shape: [batch_size, layer_k_size, layer_k+1_size]
+            # Multiply by weights and sum
+            weights = self.synapses[k].weight   # Shape: [layer_k+1_size, layer_k_size] # synapses[k] connects layer k to k+1
+            # Multiply and sum over both neuron dimensions to get per-batch energy
+            energy_J -= torch.sum(phase_diffs * weights.T, dim=(1,2))  # Shape: [batch_size]
+        
+        # Bias Energy
+        # ∑_{k=1}^{N_L} ∑_{i∈L_k} h^(k)_i |z_i|^2
+        energy_h = torch.zeros(batch_size, device=device) # i.e. we want a separate energy for each batch element
+        for k in range(len(phases)): # k indexes into phases, so add 1 for true layer number
+            abs_phi_k = phases[k].abs()**2
+            energy_h -= torch.sum(abs_phi_k * self.biases[k].unsqueeze(0), dim=1)
+        
+        # Stuart-Landau Dissipation
+        # ∑_{k=1}^{N_L} ∑_{i∈L_k} |z_i|^2 - .5 * |z_i|^4
+        energy_sl = torch.zeros(batch_size, device=device)        
+        for k in range(len(phases)):
+            sl_phi_k = -(phases[k].abs()**2 - 0.5 * phases[k].abs()**4)
+            energy_sl += torch.sum(sl_phi_k, dim=1, dtype=torch.get_default_dtype())
+        
+        # OIM energy per batch element = sum of all energy terms
+        energy = energy_J_input + energy_J + energy_h + energy_sl # Size [batch_size]
+
+        # Add loss term if in nudged phase
+        if beta != 0.0 and y is not None and criterion is not None:
+            output_activations = self.activation(phases[-1]) # Note self.activation is cos by default but can be changed to other activation functions, note it is in the range [-1,1] !!
+            
+            y_one_hot = F.one_hot(y, num_classes=self.nc).float() 
+            # Transform one-hot encoding from [0,1] to [-1,1] to match cosine output range
+            y_transformed = (y_one_hot * 2 - 1).type(torch.complex128)  # Scale from [0,1] to [-1,1]
+            loss = criterion(output_activations, y_transformed).sum(dim=1)
+            
+            energy = energy + beta * loss # Note + beta * loss is the loss term in the energy function but - beta * loss is the loss term in the primitive function # Also note energy is size [batch_size]
+        
+        return energy
+    
+    def _compute_phase_derivatives(self, x, phases, beta, y, criterion, noise_level=0.0):
+        """
+        Compute dz/dt = -∂E/∂z* for all phases
+        Returns the derivatives (gradients) for each phase layer
+        """
+        energies = self.total_energy(x, phases, beta, y, criterion)
+        grads = torch.autograd.grad(energies, phases, 
+                                    grad_outputs=torch.ones_like(energies),
+                                    create_graph=False)
+        
+        derivatives = []
+        for _, grad in enumerate(grads):
+            # dφ/dt = -∂E/∂φ
+            deriv = -grad
+            
+            # Add noise if needed
+            if noise_level > 0.0:
+                noise = torch.randn_like(grad) * noise_level
+                deriv = deriv + noise
+                
+            derivatives.append(deriv)
+        
+        return derivatives, grads
+
+    def _rk4_step(self, x, phases, beta, y, criterion, noise_level=0.0, check_thm=False):
+        """
+        Perform one RK4 step for phase updates
+        RK4: y_{n+1} = y_n + (h/6)(k1 + 2*k2 + 2*k3 + k4)
+        where:
+            k1 = f(t_n, y_n)
+            k2 = f(t_n + h/2, y_n + h*k1/2)
+            k3 = f(t_n + h/2, y_n + h*k2/2)
+            k4 = f(t_n + h, y_n + h*k3)
+        """
+        h = self.epsilon  # step size
+        
+        # k1 = f(phases)
+        k1 = self._compute_phase_derivatives(x, phases, beta, y, criterion, noise_level)
+        
+        # Intermediate phases for k2: phases + h*k1/2
+        phases_k2 = []
+        for idx, phase in enumerate(phases):
+            phase_k2 = phase + (h / 2) * k1[idx]
+            phase_k2.requires_grad_(True)
+            phases_k2.append(phase_k2)
+        k2 = self._compute_phase_derivatives(x, phases_k2, beta, y, criterion, noise_level)
+        
+        # Intermediate phases for k3: phases + h*k2/2
+        phases_k3 = []
+        for idx, phase in enumerate(phases):
+            phase_k3 = phase + (h / 2) * k2[idx]
+            phase_k3.requires_grad_(True)
+            phases_k3.append(phase_k3)
+        k3 = self._compute_phase_derivatives(x, phases_k3, beta, y, criterion, noise_level)
+        
+        # Intermediate phases for k4: phases + h*k3
+        phases_k4 = []
+        for idx, phase in enumerate(phases):
+            phase_k4 = phase + h * k3[idx]
+            phase_k4.requires_grad_(True)
+            phases_k4.append(phase_k4)
+        k4 = self._compute_phase_derivatives(x, phases_k4, beta, y, criterion, noise_level)
+        
+        # Update phases using RK4 formula
+        new_phases = []
+        for idx, phase in enumerate(phases):
+            new_phase = phase + (h / 6) * (k1[idx] + 2*k2[idx] + 2*k3[idx] + k4[idx])
+            
+            if check_thm:
+                new_phase.retain_grad()
+            else:
+                new_phase.requires_grad_(True)
+                
+            new_phases.append(new_phase)
+        
+        return new_phases
+    
+    def _semi_implicit_step(self, x, phases, beta, y, criterion, noise_level=0.0, check_thm=False):
+        """
+        Semi-implicit: update magnitude, then phase
+        Preserves limit cycle structure better
+        """
+        h = self.epsilon
+        
+        # Get gradients
+        energies = self.total_energy(x, phases, beta, y, criterion)
+        grads = torch.autograd.grad(energies, phases, 
+                                    grad_outputs=torch.ones_like(energies),
+                                    create_graph=False)
+        
+        new_phases = []
+        for _, (phase, grad) in enumerate(zip(phases, grads)):
+            # Decompose into radial and tangential
+            r = phase.abs()
+            theta = phase.angle()
+            
+            # Radial update (implicit-ish via damping)
+            grad_r = (grad * phase.conj()).real / (r + 1e-8)
+            r_new = r - h * grad_r
+            
+            # Angular update (can be explicit)
+            grad_theta = (grad * phase.conj()).imag / (r**2 + 1e-8)
+            theta_new = theta - h * grad_theta
+            
+            # Reconstruct
+            phase_new = r_new * torch.exp(1j * theta_new)
+            
+            if noise_level > 0.0:
+                noise = torch.randn_like(phase, dtype=torch.complex64) * noise_level
+                phase_new = phase_new + h * noise
+                
+            phase_new.requires_grad_(True)
+            if check_thm:
+                phase_new.retain_grad()
+                
+            new_phases.append(phase_new)
+        
+        return new_phases, grads
+
+
+    def forward(self, x, y, phases, T, beta=0.0, criterion=torch.nn.MSELoss(reduction='none'), check_thm=False, plot=False, phase_type="Free", return_velocities=False, plot_idx=0, noise_level=0.0): 
+        # Note reduction='none' is important for OIM as we want to keep the loss as a vector of size [batch_size] to compute energy gradient descent dynamcis independently for each batch element
+        """
+        Run T steps of gradient descent on the OIM energy
+        
+        Parameters:
+        - x: Input data
+        - y: Target labels
+        - phases: Initial phases
+        - T: Number of time steps
+        - beta: Nudging factor
+        - criterion: Loss function
+        - check_thm: Whether to check theorem relating EP and BPTT dynamics at various timesteps (requires keeping gradients) 
+        - plot: Whether to plot phase dynamics over time
+        - phase_type: Type of phase for labeling plots (Free/Positive/Negative/Evaluate)
+        - return_velocities: Whether to return velocities (phase changes) along with phases
+        - plot_idx: Index of the batch element to plot (default: 0)
+        - noise_level: Standard deviation of Gaussian noise to add to phases (default: 0.0)
+        """
+        
+        # Store initial phases (for possible rerun with high velocity)
+        if return_velocities:
+            initial_phases = []
+            for phase in phases:
+                initial_phases.append(phase.clone().detach())
+        
+        # If plotting is enabled, track phases over time
+        if plot:
+            # Get the correct label for the specified batch element
+            correct_label = y[plot_idx].item() if y is not None and len(y) > 0 else None
+            
+            # Store time steps and pre-allocate phase history array
+            time_steps = list(range(T+1))  # +1 to include initial state
+            # Pre-allocate phase_history as a list with None placeholders
+            phase_history = [None] * (T+1)
+            # Store initial state for the specified batch element
+            phase_history[0] = torch.cat([phase[plot_idx].detach().cpu() for phase in phases])
+
+
+        # Run T steps of gradient descent on the OIM energy
+        for t in range(T):
+            # Ensure all phases require gradients
+            for idx in range(len(phases)):
+                if not phases[idx].requires_grad:
+                    phases[idx].requires_grad_(True)
+            
+            # UPDATE PHASES USING SEMI-IMPLICIT GRADIENT DESCENT ON THE ENERGY
+            phases, grads = self._semi_implicit_step(x, phases, beta, y, criterion, noise_level, check_thm)
+
+            # If plotting is enabled, store the current phases
+            if plot:
+                # Store the specified batch element's phases at index t+1
+                phase_history[t+1] = torch.cat([phase[plot_idx].detach().cpu() for phase in phases])   
+        
+        # Create and save plot if requested after all time steps have been computed
+        if plot:
+            self._plot_phases(time_steps, phase_history, phase_type, correct_label)
+
+
+        if return_velocities:
+            # Store raw gradients as velocities (scaled by epsilon)
+            velocities = []
+            for idx in range(len(phases)):
+                # Velocity is directly proportional to gradient magnitude
+                velocity = self.epsilon * grads[idx].abs()
+                velocities.append(velocity)
 
 
 
+            ### HIGH VELOCITY CHECK ###
+               
+            # Check if any velocity is above threshold at end of dynamics
+            max_velocity_threshold = 1.0
+            high_velocity_detected = False
+            problem_batch_idx = 0
+            
+            # First scan for any batch element with high velocity
+            for vel in velocities:
+                # vel shape is [batch_size, neuron_dim]
+                # Find maximum velocity per batch element
+                batch_max_velocities = vel.max(dim=1)[0]  # Returns max values and indices
+
+                # Check if any batch element has velocity > threshold
+                if torch.any(batch_max_velocities > max_velocity_threshold):
+                    high_velocity_detected = True
+                    # Find which batch element has the highest velocity
+                    problem_batch_idx = torch.argmax(batch_max_velocities).item()
+                    max_velocity = batch_max_velocities[problem_batch_idx].item()
+                    break
+                    
+            # If high velocity detected and we're not already plotting that specific element,
+            # run forward again with plotting for the problematic element
+            if high_velocity_detected and (not plot or plot_idx != problem_batch_idx):
+                print(f"WARNING: High velocity ({max_velocity:.4f}) detected in batch element {problem_batch_idx} at end of {phase_type} phase. Generating debug plot...")
+                
+                
+                # Run forward again with plotting for the problematic example (via plot_idx)
+                # Note: We don't need the output of this call, we just want the plot
+                # DO NOT use torch.no_grad() here as we need gradients for the dynamics
+                _ = self.forward(
+                    x, 
+                    y, 
+                    initial_phases, 
+                    T, 
+                    beta=beta, 
+                    criterion=criterion, 
+                    check_thm=check_thm, 
+                    plot=True,  # Enable plotting
+                    phase_type=f"{phase_type}_high_velocity",  # Mark as high velocity case
+                    return_velocities=False,  # No need to return velocities
+                    plot_idx=problem_batch_idx,  # Plot the problematic batch element
+                    noise_level=noise_level  # Pass through the original noise level
+                )
+
+            ### ###
+
+
+
+            return phases, velocities
+        else:
+            return phases, None
+    
+    def _plot_phases(self, time_steps, phase_history, phase_type="Free", correct_label=None):
+        """
+        Plot phase evolution over time and save to file.
+        
+        Parameters:
+        - time_steps: List of time steps
+        - phase_history: List of phase tensors at each time step
+        - phase_type: Type of phase for labeling (Free/Positive/Negative/Evaluate)
+        - correct_label: Correct label for the plot
+        """
+        # Convert phase history to numpy array
+        # No need to check for None values as we've pre-allocated and filled all positions
+        phase_history = torch.stack(phase_history).numpy()
+        
+        # Create figure
+        plt.figure(figsize=(12, 8))
+        
+        
+        # Determine where output layer starts
+        hidden_sizes = self.archi[1:-1]
+        output_size = self.archi[-1]
+        output_start_idx = sum(hidden_sizes)
+        
+        # Plot hidden layer phases with light gray color
+        for i in range(output_start_idx):
+            plt.plot(time_steps, phase_history[:, i], color='gray', alpha=0.3, linewidth=0.8)
+        
+        # Plot output layer phases with distinct styles and add labels
+        # Define neon green color for correct label
+        neon_green = '#00FF00'  # Hex code for neon green
+        
+        # Color palette for output neurons, ensuring we don't use neon green for wrong labels
+        output_colors = ['red', 'blue', 'purple', 'orange', 'cyan', 'magenta', 'brown', 'black', 'gold']
+        
+        for i in range(output_size):
+            idx = output_start_idx + i
+            
+            # Determine if this is the correct label and plot with appropriate styling
+            is_correct_label = (i == correct_label)
+            
+            # All conditional logic directly in the plot function
+            plt.plot(time_steps, phase_history[:, idx], 
+                     color=neon_green if is_correct_label else output_colors[i % len(output_colors)], 
+                     linewidth=3.5 if is_correct_label else 2.5,
+                     linestyle='-' if is_correct_label else '--',
+                     alpha=1.0,
+                     label=f"Output {i}{' (Correct Label)' if is_correct_label else ''}")
+        
+        # Set plot attributes
+        title_text = f"{phase_type} Phase Dynamics"
+        if "high_velocity" in phase_type.lower():
+            title_text = f"High Velocity Detected in {phase_type.replace('_high_velocity', '')} Phase"
+            
+        plt.title(title_text)
+        plt.xlabel("Time Step")
+        plt.ylabel("Phase (radians)")
+        plt.grid(True, alpha=0.3)
+        plt.legend(loc='center left', bbox_to_anchor=(1, 0.5))
+        
+        # Save the plot with phase type information
+        filename = f"dynamics_{phase_type.lower()}.png"
+        
+        # Use self.path if available, otherwise save to current directory
+        if self.path:
+            save_path = os.path.join(self.path, filename)
+            # Ensure directory exists
+            os.makedirs(os.path.dirname(save_path), exist_ok=True)
+        else:
+            save_path = filename
+                
+        plt.tight_layout()
+        plt.savefig(save_path)
+        plt.close()
+        
+        if "high_velocity" in phase_type.lower():
+            print(f"High velocity debug plot saved as {save_path}")
+        # else:
+        #     print(f"Phase dynamics plot saved as {save_path}")
+
+    def init_neurons(self, batch_size, device):
+        """
+        Initialize phase variables. If random_phase_initialisation is True, 
+        initialize randomly between 0 and 2π with a fixed seed, same phases for all batch elements.
+        Otherwise, initialize all phases to π/2.
+        """
+        phases = []
+        if self.random_phase_initialisation:
+            # Set a fixed seed for reproducibility
+            torch.manual_seed(42)
+            for size in self.archi[1:]:
+                # Generate random phases for one instance
+                single_phase = 2j * math.pi * torch.rand((size,), device=device)
+                # Repeat for batch size
+                phase = single_phase.expand(batch_size, -1)
+                phase.requires_grad_(True)
+                phases.append(phase)
+        else:
+            for size in self.archi[1:]:
+                phase = torch.full((batch_size, size), math.pi/2j, device=device)
+                phase.requires_grad_(True)
+                phases.append(phase)
+        return phases
+    
+    def compute_syn_grads(self, x, y, phases_1, phases_2, betas, criterion, check_thm=False):
+        """
+        Compute the EP update for synaptic weights based on the difference between
+        the free fixed point and the weakly clamped fixed point
+
+        Note if we use third phase, this function is called such that beta_1 is the beta_2, and beta_2 is -beta_2
+        
+        Parameters:
+        - x: Input data
+        - y: Target labels
+        - phases_1: Phases at first equilibrium (free phase) 
+        - phases_2: Phases at second equilibrium (nudged phase)
+        - betas: Tuple of (beta_1, beta_2)
+        - criterion: Loss function
+        - check_thm: Whether we're checking the EP theorem
+        """
+
+
+        beta_1, beta_2 = betas
+        
+        self.zero_grad() # p.grad is zero i.e. zero all gradients in the parameters (weights and biases and syncs) of the model
+        
+        # Compute energy at free fixed point
+        if not check_thm:
+            energy_1 = self.total_energy(x, phases_1, beta_1, y, criterion)
+        else:
+            energy_1 = self.total_energy(x, phases_1, beta_2, y, criterion) # For check_thm=True we use beta_2 because we are comparing to previous nudged phase step not to free phase
+        energy_1 = energy_1.mean() # Get mean as want to use optimiser to minimise loss over sum of batch elements
+
+        # Compute energy at nudged fixed point
+        energy_2 = self.total_energy(x, phases_2, beta_2, y, criterion)
+        energy_2 = energy_2.mean() # Get mean as want to use optimiser to minimise loss over sum of batch elements
+        
+        # Compute delta energy (now working with scalars)
+        # Delta p = -(1/beta) (dF/dp(beta) - dF/dp(0)) for two phases 
+        # Delta p = -(1/2beta) (dF/dp(beta) - dF/dp(-beta)) for three phases
+        # We want delta_energy to be the 'loss function' i.e. we want optimiser to take negative gradient step -d/dp
+        # Therefore delta_energy = -(energy_2 - energy_1) / (beta_1 - beta_2)
+        # So for two phases with betas = 0, +beta: delta_energy = (energy(beta) - energy(0)) / beta, and optimiser step = -(1/beta) *(dF/dp(beta) - dF/dp(0))
+        # and for three phases with betas = beta, -beta: delta_energy = -(energy(-beta) - energy(beta)) / (2beta), and optimiser step = -(1/(2beta)) *(dF/dp(beta) - dF/dp(-beta))
+        delta_energy = -(energy_2 - energy_1) / (beta_1 - beta_2)
+        
+        # Backward pass to get gradients
+        delta_energy.backward()
+
+### VAN DER POL MULTI-LAYER PERCEPTRON ###
+class VDP_MLP(torch.nn.Module):
+    def __init__(self, archi, activation=lambda x : x, epsilon=0.1, random_phase_initialisation=False, path=None,
+                 intralayer_connections=None, quantisation_bits=0, J_max=1.0, h_max=1.0, sync_max=None):
+        """
+        Initialize an Oscillator Ising Machine Multi-Layer Perceptron.
+        
+        Parameters:
+        - archi: List defining the architecture [input_size, hidden_size_1, ..., output_size]
+        - activation: Activation function to use (default: torch.Ident)
+        - epsilon: Step size for OIM dynamics (default: 0.1)
+        - random_phase_initialisation: Whether to initialize phases randomly (default: False)
+        - path: Path where plot images will be saved (default: None)
+        - intralayer_connections: Whether to include trainable synaptic connections within each hidden layer (default: False)
+        - quantisation_bits: Number of bits for parameter quantization (0 means no quantization)
+        - J_max: Maximum absolute value for synaptic weights
+        - h_max: Maximum absolute value for bias parameters
+        - sync_max: Maximum absolute value for synchronization parameters
+        """
+        super(VDP_MLP, self).__init__()
+        
+        self.archi = archi
+        self.n_layers = len(archi) - 1
+        self.activation = lambda x : self.clock * x / 2
+        self.epsilon = epsilon
+        self.random_phase_initialisation = random_phase_initialisation
+        self.path = path  # Store path for saving plots
+        
+        # Store quantization parameters
+        self.quantisation_bits = quantisation_bits
+        self.J_max = J_max
+        self.h_max = h_max
+        
+        self.nc = self.archi[-1]  # Number of classes equals the last layer size
+        
+        self.softmax = False  # For compatibility with original code (Softmax readout is only defined for CNN and VFCNN)
+        
+        # Initialize synaptic weights between layers (J parameters in energy function)
+        self.synapses = torch.nn.ModuleList()
+        for idx in range(len(archi)-1):
+            
+            # Add weightings for clock signal
+            if idx == 0:
+                entry = archi[idx] + 1
+            else:
+                entry = archi[idx]
+                
+            self.synapses.append(torch.nn.Linear(entry, archi[idx+1], bias=False)) # Set bias to False as OIM do not use simple linear bias
+        
+        # Initialize biases (h parameters in energy function)
+        self.biases = torch.nn.ParameterList()
+        for idx in range(1, len(archi)): # Start from 1 as we do not have a bias for the input layer
+            
+            # Add bias for clock signal
+            if idx == 0:
+                entry = archi[idx] + 1
+            else:
+                entry = archi[idx]
+            
+            self.biases.append(torch.nn.Parameter(torch.zeros(entry))) # Initialize biases to zero
+        
+        # Initialize clock
+        self.mu = 3
+        self.clock_freq = 5
+        self.clock = 1+1j
+        
+        # Apply quantization after initialization if needed
+        if self.quantisation_bits > 0:
+            self.quantize_parameters()
+
+    def quantize_parameters(self):
+        """
+        Quantize all model parameters based on quantisation_bits and max values.
+        This function applies both value clamping and quantization to synaptic weights, biases, 
+        and sync parameters, but only when quantisation_bits > 0.
+        """
+        # Skip if quantization is disabled
+        if self.quantisation_bits <= 0:
+            return
+        
+        # Calculate quantization step sizes based on bits and max values
+        J_levels = 2 ** self.quantisation_bits - 1
+        h_levels = 2 ** self.quantisation_bits - 1
+        # sync_levels = 2 ** self.quantisation_bits - 1
+        
+        J_step = 2 * self.J_max / J_levels
+        h_step = 2 * self.h_max / h_levels
+        # sync_step = 2 * self.sync_max / sync_levels
+        
+        # Quantize synaptic weights
+        for synapse in self.synapses:
+            # Clip weights to [-J_max, J_max]
+            synapse.weight.data.clamp_(-self.J_max, self.J_max)
+            # Quantize to discrete levels
+            synapse.weight.data = torch.round(synapse.weight.data / J_step) * J_step
+        
+        # Quantize intralayer synaptic weights if enabled
+        if self.intralayer_connections:
+            for synapse in self.intralayer_synapses:
+                synapse.weight.data.clamp_(-self.J_max, self.J_max)
+                synapse.weight.data = torch.round(synapse.weight.data / J_step) * J_step
+        
+        # Quantize biases
+        for bias in self.biases:
+            bias.data.clamp_(-self.h_max, self.h_max)
+            bias.data = torch.round(bias.data / h_step) * h_step
+            
+    def _clock_grad(self):
+                
+        z = self.clock
+        z_conj = self.clock.conj
+        
+        # Term 1: -iwz̄z
+        term1 = -1j * self.clock_freq * z_conj * z
+        # Term 2: (μ/2)zz̄
+        term2 = (self.mu / 2) * z * z_conj
+        # Term 3: -(μ/4)z̄²
+        term3 = -(self.mu / 4) * z_conj**2
+        # Term 4: -(μ/8)[z³z̄ + (z²z̄²)/2 - (zz̄³)/3 - z̄⁴/4]
+        term4 = -(self.mu / 8) * (
+            z**3 * z_conj + 
+            (z**2 * z_conj**2) / 2 - 
+            (z * z_conj**3) / 3 - 
+            z_conj**4 / 4
+        )
+        # Sum all terms (take real part since energy should be real)
+        V_k = term1 + term2 + term3 + term4
+        
+        grad = torch.autograd.grad(V_k, self.clock, 
+                                    grad_outputs=torch.ones_like(),
+                                    create_graph=False)
+ 
+        return -grad
+
+    def _clock_step(self):
+        """
+        Perform one RK4 step for clock update
+        RK4: y_{n+1} = y_n + (h/6)(k1 + 2*k2 + 2*k3 + k4)
+        """
+        h = self.epsilon  # step size
+        
+        # Store original clock
+        clock_orig = self.clock
+        
+        # k1 = f(clock)
+        k1 = self.clock_grad()
+        
+        # k2: clock + h*k1/2
+        self.clock = clock_orig + (h / 2) * k1
+        self.clock.requires_grad_(True)
+        k2 = self.clock_grad()
+        
+        # k3: clock + h*k2/2
+        self.clock = clock_orig + (h / 2) * k2
+        self.clock.requires_grad_(True)
+        k3 = self.clock_grad()
+        
+        # k4: clock + h*k3
+        self.clock = clock_orig + h * k3
+        self.clock.requires_grad_(True)
+        k4 = self.clock_grad()
+        
+        # Update clock using RK4 formula
+        self.clock = clock_orig + (h / 6) * (k1 + 2*k2 + 2*k3 + k4)
+        self.clock.requires_grad_(True)
+        
+    def total_energy(self, x: torch.Tensor, phases : torch.Tensor, beta=0.0, y=None, criterion=None):
+        """
+        Compute the OIM 'total' energy function, F:
+
+        F = E_OIM + beta * L, 
+        - for loss function L
+        - for OIM energy funcition E_OIM = E^J_OIM + E^h_OIM + E^K_s_OIM
+        
+        OIM dynamics are given by dφ_i/dt = -δF/δφ_i (i.e. the gradient of the energy function with respect to the PHASES) in both free (beta=0) and nudged (beta != 0) phases
+        - They are computed here by automatic differentiation framework 
+
+        Parameters:
+        - x: Input data [batch_size, input_dim]
+        - phases: List of phase variables for each layer EXCLUDING the input layer (which are always clamped)
+        - beta: Nudging factor for the loss
+        - y: Target labels (optional)
+        - criterion: Loss function (optional)
+        """
+        
+        x = x.type(torch.complex128)
+
+        batch_size = x.size(0)
+        device = x.device
+        energy = torch.zeros(batch_size, device=device) # i.e. we want a separate energy for each batch element so we can calculate energy gradient descent dynamics for each batch element independently
+        x_flat = x.view(batch_size, -1)
+        
+        # Concatenate clock to end of input
+        clock_expanded = (torch.ones(1,dtype=torch.complex128,device=device)*self.clock).unsqueeze(0).expand(batch_size, -1)  # Shape: [batch_size, 1]
+        x_flat = torch.cat([x_flat, clock_expanded], dim=1)  # Shape: [batch_size, input_dim + 1]
+        energy_J_input = -torch.sum(((x_flat.unsqueeze(2) - phases[0].unsqueeze(1)).abs()**2) * self.synapses[0].weight.T, dim=(1,2))  # Shape: [batch_size]
+        
+        # Weight energy
+        # -∑_{k=1}^{N_L-1} ∑_{i∈L_k, j∈L_{k+1}} J^(k)_{ij} |φ_i - φ_j|^2
+        energy_J = torch.zeros(batch_size, device=device) # i.e. we want a separate energy for each batch element
+        for k in range(1, len(phases)):  # k starts at 1 (second hidden layer) and goes up to len(phases)-1 (which is the index of the output layer) but we incorporate weights 'from behind'
+            # Process entire batch at once
+            phi_k = phases[k-1].unsqueeze(2)    # Shape: [batch_size, layer_k_size, 1] # phases[k-1] is layer k
+            phi_k_plus_1 = phases[k].unsqueeze(1)     # Shape: [batch_size, 1, layer_k+1_size] # phases[k] is layer k+1
+            phase_diffs = (phi_k - phi_k_plus_1).abs()**2       # Shape: [batch_size, layer_k_size, layer_k+1_size]
+            # Multiply by weights and sum
+            weights = self.synapses[k].weight   # Shape: [layer_k+1_size, layer_k_size] # synapses[k] connects layer k to k+1
+            # Multiply and sum over both neuron dimensions to get per-batch energy
+            energy_J -= torch.sum(phase_diffs * weights.T, dim=(1,2))  # Shape: [batch_size]
+        
+        # Bias Energy
+        # ∑_{k=1}^{N_L} ∑_{i∈L_k} h^(k)_i |z_i|^2
+        energy_h = torch.zeros(batch_size, device=device, dtype=torch.complex128) # i.e. we want a separate energy for each batch element
+        for k in range(len(phases)): # k indexes into phases, so add 1 for true layer number
+            abs_phi_k = phases[k].abs()**2
+            energy_h -= torch.sum(abs_phi_k * self.biases[k].unsqueeze(0), dim=1)
+        
+        # Van der Pol Dissipation
+        # V = -iwz̄z + (μ/2)zz̄ - (μ/4)z̄² - (μ/8)[z³z̄ + (z²z̄²)/2 - (zz̄³)/3 - z̄⁴/4]
+        energy_vdp = torch.zeros(batch_size, dtype=torch.complex128, device=device)
+        for k in range(len(phases)):
+            z = phases[k]
+            z_conj = torch.conj(z)
+            
+            # Term 1: -iwz̄z
+            term1 = -1j * self.clock_freq * z_conj * z
+            # Term 2: (μ/2)zz̄
+            term2 = (self.mu / 2) * z * z_conj
+            # Term 3: -(μ/4)z̄²
+            term3 = -(self.mu / 4) * z_conj**2
+            # Term 4: -(μ/8)[z³z̄ + (z²z̄²)/2 - (zz̄³)/3 - z̄⁴/4]
+            term4 = -(self.mu / 8) * (
+                z**3 * z_conj + 
+                (z**2 * z_conj**2) / 2 - 
+                (z * z_conj**3) / 3 - 
+                z_conj**4 / 4
+            )
+            # Sum all terms
+            V_k = term1 + term2 + term3 + term4
+            energy_vdp += torch.sum(V_k, dim=1)
+                    
+        # OIM energy per batch element = sum of all energy terms
+        energy = energy_J_input + energy_J + energy_h + energy_vdp # Size [batch_size]
+
+        # Add loss term if in nudged phase
+        if beta != 0.0 and y is not None and criterion is not None:
+            output_activations = self.activation(phases[-1]) # Note self.activation is cos by default but can be changed to other activation functions, note it is in the range [-1,1] !!
+            
+            y_one_hot = F.one_hot(y, num_classes=self.nc).float() 
+            # Transform one-hot encoding from [0,1] to [-1,1] to match cosine output range
+            y_transformed = (y_one_hot * 2 - 1).type(torch.complex128)  # Scale from [0,1] to [-1,1]
+            loss = criterion(output_activations, y_transformed).sum(dim=1)
+            
+            energy = energy + beta * loss # Note + beta * loss is the loss term in the energy function but - beta * loss is the loss term in the primitive function # Also note energy is size [batch_size]
+        
+        return energy
+    
+    def _compute_phase_derivatives(self, x, phases, beta, y, criterion, noise_level=0.0):
+        """
+        Compute dz/dt = -∂E/∂z* for all phases
+        Returns the derivatives (gradients) for each phase layer
+        """
+        energies = self.total_energy(x, phases, beta, y, criterion)
+        grads = torch.autograd.grad(energies, phases, 
+                                    grad_outputs=torch.ones_like(energies),
+                                    create_graph=False)
+        
+        derivatives = []
+        for _, grad in enumerate(grads):
+            # dφ/dt = -∂E/∂φ
+            deriv = -grad
+            
+            # Add noise if needed
+            if noise_level > 0.0:
+                noise = torch.randn_like(grad) * noise_level
+                deriv = deriv + noise
+                
+            derivatives.append(deriv)
+        
+        return derivatives, grads
+
+    def _rk4_step(self, x, phases, beta, y, criterion, noise_level=0.0, check_thm=False):
+        """
+        Perform one RK4 step for phase updates
+        RK4: y_{n+1} = y_n + (h/6)(k1 + 2*k2 + 2*k3 + k4)
+        where:
+            k1 = f(t_n, y_n)
+            k2 = f(t_n + h/2, y_n + h*k1/2)
+            k3 = f(t_n + h/2, y_n + h*k2/2)
+            k4 = f(t_n + h, y_n + h*k3)
+        """
+        h = self.epsilon  # step size
+        
+        # k1 = f(phases)
+        k1 = self._compute_phase_derivatives(x, phases, beta, y, criterion, noise_level)
+        
+        # Intermediate phases for k2: phases + h*k1/2
+        phases_k2 = []
+        for idx, phase in enumerate(phases):
+            phase_k2 = phase + (h / 2) * k1[idx]
+            phase_k2.requires_grad_(True)
+            phases_k2.append(phase_k2)
+        k2 = self._compute_phase_derivatives(x, phases_k2, beta, y, criterion, noise_level)
+        
+        # Intermediate phases for k3: phases + h*k2/2
+        phases_k3 = []
+        for idx, phase in enumerate(phases):
+            phase_k3 = phase + (h / 2) * k2[idx]
+            phase_k3.requires_grad_(True)
+            phases_k3.append(phase_k3)
+        k3 = self._compute_phase_derivatives(x, phases_k3, beta, y, criterion, noise_level)
+        
+        # Intermediate phases for k4: phases + h*k3
+        phases_k4 = []
+        for idx, phase in enumerate(phases):
+            phase_k4 = phase + h * k3[idx]
+            phase_k4.requires_grad_(True)
+            phases_k4.append(phase_k4)
+        k4 = self._compute_phase_derivatives(x, phases_k4, beta, y, criterion, noise_level)
+        
+        # Update phases using RK4 formula
+        new_phases = []
+        for idx, phase in enumerate(phases):
+            new_phase = phase + (h / 6) * (k1[idx] + 2*k2[idx] + 2*k3[idx] + k4[idx])
+            
+            if check_thm:
+                new_phase.retain_grad()
+            else:
+                new_phase.requires_grad_(True)
+                
+            new_phases.append(new_phase)
+        
+        return new_phases
+
+    def forward(self, x, y, phases, T, beta=0.0, criterion=torch.nn.MSELoss(reduction='none'), check_thm=False, plot=False, phase_type="Free", return_velocities=False, plot_idx=0, noise_level=0.0): 
+        # Note reduction='none' is important for OIM as we want to keep the loss as a vector of size [batch_size] to compute energy gradient descent dynamcis independently for each batch element
+        """
+        Run T steps of gradient descent on the OIM energy
+        
+        Parameters:
+        - x: Input data
+        - y: Target labels
+        - phases: Initial phases
+        - T: Number of time steps
+        - beta: Nudging factor
+        - criterion: Loss function
+        - check_thm: Whether to check theorem relating EP and BPTT dynamics at various timesteps (requires keeping gradients) 
+        - plot: Whether to plot phase dynamics over time
+        - phase_type: Type of phase for labeling plots (Free/PositiveReal/NegativeReal/PositiveImaginary/NegativeImaginary/Evaluate)
+        - return_velocities: Whether to return velocities (phase changes) along with phases
+        - plot_idx: Index of the batch element to plot (default: 0)
+        - noise_level: Standard deviation of Gaussian noise to add to phases (default: 0.0)
+        """
+        
+        # Store initial phases (for possible rerun with high velocity)
+        if return_velocities:
+            initial_phases = []
+            for phase in phases:
+                initial_phases.append(phase.clone().detach())
+        
+        # If plotting is enabled, track phases over time
+        if plot:
+            # Get the correct label for the specified batch element
+            correct_label = y[plot_idx].item() if y is not None and len(y) > 0 else None
+            
+            # Store time steps and pre-allocate phase history array
+            time_steps = list(range(T+1))  # +1 to include initial state
+            # Pre-allocate phase_history as a list with None placeholders
+            phase_history = [None] * (T+1)
+            # Store initial state for the specified batch element
+            phase_history[0] = torch.cat([phase[plot_idx].detach().cpu() for phase in phases])
+
+
+        # Run T steps of gradient descent on the OIM energy
+        for t in range(T):
+            # Ensure all phases require gradients
+            for idx in range(len(phases)):
+                if not phases[idx].requires_grad:
+                    phases[idx].requires_grad_(True)
+            
+            # UPDATE PHASES USING RK4 GRADIENT DESCENT ON THE ENERGY
+            phases, grads = self._rk4_step(x, phases, beta, y, criterion, noise_level, check_thm)
+
+            # If plotting is enabled, store the current phases
+            if plot:
+                # Store the specified batch element's phases at index t+1
+                phase_history[t+1] = torch.cat([phase[plot_idx].detach().cpu() for phase in phases]) 
+                
+            # UPDATE CLOCK USING RK4:
+            self._clock_step()
+              
+        
+        # Create and save plot if requested after all time steps have been computed
+        if plot:
+            self._plot_phases(time_steps, phase_history, phase_type, correct_label)
+
+
+        if return_velocities:
+            # Store raw gradients as velocities (scaled by epsilon)
+            velocities = []
+            for idx in range(len(phases)):
+                # Velocity is directly proportional to gradient magnitude
+                velocity = self.epsilon * grads[idx].abs()
+                velocities.append(velocity)
+
+            ### HIGH VELOCITY CHECK ###
+               
+            # Check if any velocity is above threshold at end of dynamics
+            max_velocity_threshold = 1.0
+            high_velocity_detected = False
+            problem_batch_idx = 0
+            
+            # First scan for any batch element with high velocity
+            for vel in velocities:
+                # vel shape is [batch_size, neuron_dim]
+                # Find maximum velocity per batch element
+                batch_max_velocities = vel.max(dim=1)[0]  # Returns max values and indices
+
+                # Check if any batch element has velocity > threshold
+                if torch.any(batch_max_velocities > max_velocity_threshold):
+                    high_velocity_detected = True
+                    # Find which batch element has the highest velocity
+                    problem_batch_idx = torch.argmax(batch_max_velocities).item()
+                    max_velocity = batch_max_velocities[problem_batch_idx].item()
+                    break
+                    
+            # If high velocity detected and we're not already plotting that specific element,
+            # run forward again with plotting for the problematic element
+            if high_velocity_detected and (not plot or plot_idx != problem_batch_idx):
+                print(f"WARNING: High velocity ({max_velocity:.4f}) detected in batch element {problem_batch_idx} at end of {phase_type} phase. Generating debug plot...")
+                
+                
+                # Run forward again with plotting for the problematic example (via plot_idx)
+                # Note: We don't need the output of this call, we just want the plot
+                # DO NOT use torch.no_grad() here as we need gradients for the dynamics
+                _ = self.forward(
+                    x, 
+                    y, 
+                    initial_phases, 
+                    T, 
+                    beta=beta, 
+                    criterion=criterion, 
+                    check_thm=check_thm, 
+                    plot=True,  # Enable plotting
+                    phase_type=f"{phase_type}_high_velocity",  # Mark as high velocity case
+                    return_velocities=False,  # No need to return velocities
+                    plot_idx=problem_batch_idx,  # Plot the problematic batch element
+                    noise_level=noise_level  # Pass through the original noise level
+                )
+
+            ### ###
+
+
+
+            return phases, velocities
+        else:
+            return phases, None
+    
+    def _plot_phases(self, time_steps, phase_history, phase_type="Free", correct_label=None):
+        """
+        Plot phase evolution over time and save to file.
+        
+        Parameters:
+        - time_steps: List of time steps
+        - phase_history: List of phase tensors at each time step
+        - phase_type: Type of phase for labeling (Free/Positive/Negative/Evaluate)
+        - correct_label: Correct label for the plot
+        """
+        # Convert phase history to numpy array
+        # No need to check for None values as we've pre-allocated and filled all positions
+        phase_history = torch.stack(phase_history).numpy()
+        
+        # Create figure
+        plt.figure(figsize=(12, 8))
+        
+        
+        # Determine where output layer starts
+        hidden_sizes = self.archi[1:-1]
+        output_size = self.archi[-1]
+        output_start_idx = sum(hidden_sizes)
+        
+        # Plot hidden layer phases with light gray color
+        for i in range(output_start_idx):
+            plt.plot(time_steps, phase_history[:, i], color='gray', alpha=0.3, linewidth=0.8)
+        
+        # Plot output layer phases with distinct styles and add labels
+        # Define neon green color for correct label
+        neon_green = '#00FF00'  # Hex code for neon green
+        
+        # Color palette for output neurons, ensuring we don't use neon green for wrong labels
+        output_colors = ['red', 'blue', 'purple', 'orange', 'cyan', 'magenta', 'brown', 'black', 'gold']
+        
+        for i in range(output_size):
+            idx = output_start_idx + i
+            
+            # Determine if this is the correct label and plot with appropriate styling
+            is_correct_label = (i == correct_label)
+            
+            # All conditional logic directly in the plot function
+            plt.plot(time_steps, phase_history[:, idx], 
+                     color=neon_green if is_correct_label else output_colors[i % len(output_colors)], 
+                     linewidth=3.5 if is_correct_label else 2.5,
+                     linestyle='-' if is_correct_label else '--',
+                     alpha=1.0,
+                     label=f"Output {i}{' (Correct Label)' if is_correct_label else ''}")
+        
+        # Set plot attributes
+        title_text = f"{phase_type} Phase Dynamics"
+        if "high_velocity" in phase_type.lower():
+            title_text = f"High Velocity Detected in {phase_type.replace('_high_velocity', '')} Phase"
+            
+        plt.title(title_text)
+        plt.xlabel("Time Step")
+        plt.ylabel("Phase (radians)")
+        plt.grid(True, alpha=0.3)
+        plt.legend(loc='center left', bbox_to_anchor=(1, 0.5))
+        
+        # Save the plot with phase type information
+        filename = f"dynamics_{phase_type.lower()}.png"
+        
+        # Use self.path if available, otherwise save to current directory
+        if self.path:
+            save_path = os.path.join(self.path, filename)
+            # Ensure directory exists
+            os.makedirs(os.path.dirname(save_path), exist_ok=True)
+        else:
+            save_path = filename
+                
+        plt.tight_layout()
+        plt.savefig(save_path)
+        plt.close()
+        
+        if "high_velocity" in phase_type.lower():
+            print(f"High velocity debug plot saved as {save_path}")
+        # else:
+        #     print(f"Phase dynamics plot saved as {save_path}")
+
+    def init_neurons(self, batch_size, device):
+        """
+        Initialize phase variables. If random_phase_initialisation is True, 
+        initialize randomly between 0 and 2π with a fixed seed, same phases for all batch elements.
+        Otherwise, initialize all phases to π/2.
+        """
+        phases = []
+        if self.random_phase_initialisation:
+            # Set a fixed seed for reproducibility
+            torch.manual_seed(42)
+            for size in self.archi[1:]:
+                # Generate random phases for one instance
+                single_phase = 2j * math.pi * torch.rand((size,), device=device)
+                # Repeat for batch size
+                phase = single_phase.expand(batch_size, -1)
+                phase.requires_grad_(True)
+                phases.append(phase)
+        else:
+            for size in self.archi[1:]:
+                phase = torch.full((batch_size, size), math.pi/2j, device=device)
+                phase.requires_grad_(True)
+                phases.append(phase)
+        return phases
+    
+    def compute_syn_grads(self, x, y, phase_pos_real, phase_neg_real, phase_pos_im, phase_neg_im, beta, criterion, check_thm=False):
+        """
+        Compute the EP update for synaptic weights based on the difference between
+        the free fixed point and the weakly clamped fixed point
+
+        Note if we use third phase, this function is called such that beta_1 is the beta_2, and beta_2 is -beta_2
 
         
+        Parameters:
+        - x: Input data
+        - y: Target labels
+        - phases_1: Phases at first equilibrium (free phase) 
+        - phases_2: Phases at second equilibrium (nudged phase)
+        - betas: Tuple of (beta_1, beta_2)
+        - criterion: Loss function
+        - check_thm: Whether we're checking the EP theorem
+        """
 
+        self.zero_grad() # p.grad is zero i.e. zero all gradients in the parameters (weights and biases and syncs) of the model
+        
+        # Compute energy at each nudged point
+        energy_pos_real = self.total_energy(x,phase_pos_real, beta, y, criterion).mean()
+        energy_neg_real = self.total_energy(x,phase_neg_real, -beta, y, criterion).mean()
+        energy_pos_im = self.total_energy(x,phase_pos_im, 1j*beta, y, criterion).mean()
+        energy_neg_im = self.total_energy(x,phase_neg_im, -1j*beta, y, criterion).mean()
+        
+        delta_energy = ((energy_pos_real-energy_neg_real)+1j*(energy_pos_im-energy_neg_im)) / (2 ** 0.5) * beta
+        
+        # Backward pass to get gradients
+        delta_energy.backward()
 
-
+###  ###
+        
+class ComplexMSELoss(torch.nn.Module):
+    def __init__(self, reduction='none'):
+        super().__init__()
+        self.reduction = reduction
+    
+    def forward(self, x, y):
+        diff = x - y
+        loss = 0.5 * (diff * diff.conj()).real  # Take real part for gradient
+        
+        if self.reduction == 'mean':
+            return loss.mean()
+        elif self.reduction == 'sum':
+            return loss.sum()
+        return loss
 
 ### PRIMITIVE MLP ###
 

@@ -1,0 +1,21 @@
+python launch.py `
+--model 'VDP_MLP' `
+--task 'MNIST' `
+--archi 784 512 10 `
+--alg 'FPEP' `
+--optim 'sgd' `
+--thirdphase `
+--epochs 2 `
+--act 'identity' `
+--todo 'train' `
+--input-positive-negative-mapping `
+--loss 'complex_mse' `
+--betas 0.1 0.1 `
+--epsilon 0.05 `
+--T1 30 `
+--T2 10 `
+--mbs 256 `
+--device 0 `
+--num-repeats 1 `
+--num-workers 1 `
+--save  

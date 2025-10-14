@@ -109,6 +109,10 @@ class ModelTrainer:
             self.model_class = OIM_MLP
         elif self.args.model == 'MLP':
             self.model_class = P_MLP
+        elif self.args.model == 'SL_MLP':
+            self.model_class = SL_MLP
+        elif self.args.model == 'VDP_MLP':
+            self.model_class = VDP_MLP
         # elif self.args.model == 'CNN_EP':
             # self.model_class = CNN_EP
         else:
@@ -120,6 +124,8 @@ class ModelTrainer:
             self.criterion = torch.nn.MSELoss(reduction='none').to(self.device)
         elif self.args.loss == 'cel':
             self.criterion = torch.nn.CrossEntropyLoss(reduction='none').to(self.device)
+        elif self.args.loss == 'complex_mse':
+            self.criterion = ComplexMSELoss(reduction='none').to(self.device)
         else:
             raise ValueError(f"Loss {self.args.loss} not supported")
         print('loss =', self.criterion)
@@ -193,7 +199,7 @@ class ModelTrainer:
                     optim_params.append({'params': synapse.parameters(), 'lr': lr})
 
         # Handle OIM_MLP specific parameters (biases and syncs)
-        if isinstance(model, OIM_MLP):
+        if isinstance(model, OIM_MLP) or isinstance(model, SL_MLP):
             # Add bias parameters with custom learning rates
             if hasattr(self.args, 'bias_lrs') and self.args.bias_lrs:
                 for idx, bias in enumerate(model.biases):
@@ -219,7 +225,7 @@ class ModelTrainer:
                             optim_params.append({'params': [sync], 'lr': lr, 'weight_decay': wd})
                         else:
                             optim_params.append({'params': [sync], 'lr': lr})
-
+                            
         # Create the optimizer with the parameter groups
         if self.args.optim == 'sgd':
             return torch.optim.SGD(optim_params, momentum=self.args.mmt)
@@ -256,6 +262,8 @@ class ModelTrainer:
             return my_hard_sig
         elif act_name == 'ctrd_hard_sig':
             return ctrd_hard_sig
+        elif act_name == 'identity':
+            return lambda x : x
         else:
             print(f"Warning: Unknown activation '{act_name}', defaulting to cos")
             return torch.cos

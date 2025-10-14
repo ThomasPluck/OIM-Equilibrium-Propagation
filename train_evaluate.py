@@ -189,6 +189,16 @@ def train_minibatch(model, optimizer, data, targets, args, criterion, epoch_idx=
             # Transform one-hot encoding from [0,1] to [-1,1] to match output range if using activation
             y_transformed = y_one_hot * 2 - 1 if hasattr(model, 'activation') else y_one_hot
             loss = 0.5 * criterion(model_output.float(), y_transformed).sum(dim=1).mean().squeeze()
+        elif isinstance(model, SL_MLP):
+            model_output = neurons[-1]
+            y_one_hot = F.one_hot(targets, num_classes=model.nc).float()
+            y_transformed = (y_one_hot * 2 - 1).type(torch.complex128)
+            batch_loss = criterion(model_output, y_transformed).sum(dim=1).mean().squeeze()
+        elif isinstance(model, VDP_MLP):
+            model_output = neurons[-1]*model.clock/2
+            y_one_hot = F.one_hot(targets, num_classes=model.nc).float()
+            y_transformed = (y_one_hot * 2 - 1).type(torch.complex128)
+            batch_loss = criterion(model_output, y_transformed).sum(dim=1).mean().squeeze()
         else:
             if not getattr(model, 'softmax', False):
                 loss = criterion(model_output.float(), targets).mean().squeeze()
@@ -200,6 +210,90 @@ def train_minibatch(model, optimizer, data, targets, args, criterion, epoch_idx=
         
         # Backpropagation through time
         loss.backward()
+        
+    elif args.alg == 'FPEP':
+        
+        ### FREE PHASE ###
+        # Run free phase with or without velocity tracking
+        neurons, velocities_free = model(data, targets, neurons, args.T1, 
+                                       beta=beta_1, criterion=criterion, 
+                                       plot=should_plot, phase_type="Free", 
+                                       return_velocities=should_get_metrics, 
+                                       noise_level=args.noise_level)
+        
+        # Calculate metrics if tracking is enabled
+        if should_get_metrics:
+            result['convergence_metrics']['free'] = get_convergence_metrics(velocities_free, phase_type="free")
+            result['binarization_metrics']['free'] = get_binarization_metrics(model, neurons, phase_type="free")
+        
+        neurons_1 = copy(neurons)
+        
+        ### Determine whether to quantise neurons ###
+        if args.neuron_quantisation_bits > 0:
+            neurons_1 = quantize_neural_states(neurons_1, model, args.neuron_quantisation_bits)
+        
+        ### NUDGED/POSITIVE PHASE ###
+        
+        neurons = copy(neurons_1)
+        # Run nudged phase with or without velocity tracking
+        neurons, velocities_positive = model(data, targets, neurons, args.T2, 
+                                          beta=beta_2, criterion=criterion, 
+                                          plot=should_plot, phase_type="Positive", 
+                                          return_velocities=should_get_metrics, 
+                                          noise_level=args.noise_level)
+        
+        
+        neurons_2 = copy(neurons)
+        
+        ### Determine whether to quantise neurons ###
+        if args.neuron_quantisation_bits > 0:
+            neurons_2 = quantize_neural_states(neurons_2, model, args.neuron_quantisation_bits)
+            
+        neurons = copy(neurons_1)
+        # Run nudged phase with or without velocity tracking
+        neurons, velocities_positive = model(data, targets, neurons, args.T2, 
+                                          beta=-beta_2, criterion=criterion, 
+                                          plot=should_plot, phase_type="Positive", 
+                                          return_velocities=should_get_metrics, 
+                                          noise_level=args.noise_level)
+        
+        neurons_3 = copy(neurons)
+        
+        ### Determine whether to quantise neurons ###
+        if args.neuron_quantisation_bits > 0:
+            neurons_3 = quantize_neural_states(neurons_3, model, args.neuron_quantisation_bits)
+        
+        neurons = copy(neurons_1)
+        # Run nudged phase with or without velocity tracking
+        neurons, velocities_positive = model(data, targets, neurons, args.T2, 
+                                          beta=1j*beta_2, criterion=criterion, 
+                                          plot=should_plot, phase_type="Positive", 
+                                          return_velocities=should_get_metrics, 
+                                          noise_level=args.noise_level)
+        
+        neurons_4 = copy(neurons)
+        
+        ### Determine whether to quantise neurons ###
+        if args.neuron_quantisation_bits > 0:
+            neurons_4 = quantize_neural_states(neurons_4, model, args.neuron_quantisation_bits)
+        
+        
+        neurons = copy(neurons_1)
+        # Run nudged phase with or without velocity tracking
+        neurons, velocities_positive = model(data, targets, neurons, args.T2, 
+                                          beta=-1j*beta_2, criterion=criterion, 
+                                          plot=should_plot, phase_type="Positive", 
+                                          return_velocities=should_get_metrics, 
+                                          noise_level=args.noise_level)
+        
+        neurons_5 = copy(neurons)
+        
+        ### Determine whether to quantise neurons ###
+        if args.neuron_quantisation_bits > 0:
+            neurons_5 = quantize_neural_states(neurons_5, model, args.neuron_quantisation_bits)
+        
+        
+        model.compute_syn_grads(data, targets, neurons_2, neurons_3, neurons_4, neurons_5, beta_2, criterion)
     
     ### PARAMETER UPDATE ###
     # Update parameters
@@ -224,6 +318,10 @@ def train_minibatch(model, optimizer, data, targets, args, criterion, epoch_idx=
             if isinstance(model, OIM_MLP):
                 # For OIM models, convert phases to activations
                 model_output = model.activation(eval_neurons[-1])
+            elif isinstance(model, SL_MLP):
+                model_output = (eval_neurons[-1]/eval_neurons[-1].abs()).real
+            elif isinstance(model, VDP_MLP):
+                model_output = (eval_neurons[-1]*model.clock/2).real
             else:
                 # For standard models like P_MLP, neurons already contain activations
                 model_output = eval_neurons[-1]
@@ -248,6 +346,16 @@ def train_minibatch(model, optimizer, data, targets, args, criterion, epoch_idx=
             y_transformed = y_one_hot * 2 - 1 if isinstance(model, OIM_MLP) else y_one_hot
             
             batch_loss = 0.5*criterion(model_output.float(), y_transformed).sum(dim=1).mean().squeeze()
+        elif isinstance(model,SL_MLP): # Special case for SL_MLP
+            model_output = eval_neurons[-1]
+            y_one_hot = F.one_hot(targets, num_classes=model.nc).float()
+            y_transformed = (y_one_hot * 2 - 1).type(torch.complex128)
+            batch_loss = criterion(model_output, y_transformed).sum(dim=1).mean().squeeze()
+        elif isinstance(model,VDP_MLP): # Special case for VDP_MLP
+            model_output = eval_neurons[-1]*model.clock
+            y_one_hot = F.one_hot(targets, num_classes=model.nc).float()
+            y_transformed = (y_one_hot * 2 - 1).type(torch.complex128)
+            batch_loss = criterion(model_output, y_transformed).sum(dim=1).mean().squeeze()
         else:
             if not model.softmax: # e.g. for cross entropy loss
                 batch_loss = criterion(model_output.float(), targets).mean().squeeze()
@@ -652,6 +760,10 @@ def evaluate(model, loader, T, device, plot=False, return_velocities=False, crit
             if isinstance(model, OIM_MLP):
                 # For OIM models, convert phases to activations
                 model_output = model.activation(neurons[-1])
+            elif isinstance(model, SL_MLP):
+                model_output = neurons[-1]
+            elif isinstance(model, VDP_MLP):
+                model_output = neurons[-1] * model.clock
             else:
                 # For standard models like P_MLP, neurons already contain activations
                 model_output = neurons[-1]
