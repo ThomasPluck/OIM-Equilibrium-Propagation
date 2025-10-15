@@ -1350,10 +1350,13 @@ class VDP_MLP(torch.nn.Module):
             
             self.biases.append(torch.nn.Parameter(torch.zeros(entry))) # Initialize biases to zero
         
-        # Initialize clock
+        # Initialize clock parameters (Van der Pol oscillator)
         self.mu = 3
         self.clock_freq = 5
-        self.clock = 1+1j
+        # Clock state: position and velocity for Van der Pol oscillator
+        # Start on or near limit cycle: z = r*e^(iωt) with r ≈ 2
+        self.register_buffer('_clock_z', torch.tensor(2.0+0.0j, dtype=torch.complex128))
+        self.register_buffer('_clock_zdot', torch.tensor(0.0+10.0j, dtype=torch.complex128))  # velocity ≈ iω*z
         
         # Apply quantization after initialization if needed
         if self.quantisation_bits > 0:
@@ -1396,64 +1399,54 @@ class VDP_MLP(torch.nn.Module):
             bias.data.clamp_(-self.h_max, self.h_max)
             bias.data = torch.round(bias.data / h_step) * h_step
             
-    def _clock_grad(self):
-                
-        z = self.clock
-        z_conj = self.clock.conj
-        
-        # Term 1: -iwz̄z
-        term1 = -1j * self.clock_freq * z_conj * z
-        # Term 2: (μ/2)zz̄
-        term2 = (self.mu / 2) * z * z_conj
-        # Term 3: -(μ/4)z̄²
-        term3 = -(self.mu / 4) * z_conj**2
-        # Term 4: -(μ/8)[z³z̄ + (z²z̄²)/2 - (zz̄³)/3 - z̄⁴/4]
-        term4 = -(self.mu / 8) * (
-            z**3 * z_conj + 
-            (z**2 * z_conj**2) / 2 - 
-            (z * z_conj**3) / 3 - 
-            z_conj**4 / 4
-        )
-        # Sum all terms (take real part since energy should be real)
-        V_k = term1 + term2 + term3 + term4
-        
-        grad = torch.autograd.grad(V_k, self.clock, 
-                                    grad_outputs=torch.ones_like(),
-                                    create_graph=False)
- 
-        return -grad
-
+    @property
+    def clock(self):
+        """Return current clock value (position of Van der Pol oscillator)"""
+        return self._clock_z
+    
+    def _clock_rhs(self, z, zdot):
+        """
+        Compute RHS of Van der Pol oscillator equations:
+        dz/dt = zdot
+        d²z/dt² = μ(1 - |z|²)zdot - ω²z
+        """
+        z_mag_sq = (z.conj() * z).real
+        # d(zdot)/dt = μ(1 - |z|²)zdot - ω²z
+        zdotdot = self.mu * (1 - z_mag_sq) * zdot - (self.clock_freq ** 2) * z
+        return zdot, zdotdot
+    
     def _clock_step(self):
         """
-        Perform one RK4 step for clock update
-        RK4: y_{n+1} = y_n + (h/6)(k1 + 2*k2 + 2*k3 + k4)
+        Advance clock using RK4 integration of Van der Pol oscillator.
+        No gradients needed - this is just numerical integration.
         """
-        h = self.epsilon  # step size
+        h = self.epsilon
         
-        # Store original clock
-        clock_orig = self.clock
+        # Current state
+        z0 = self._clock_z.clone()
+        zdot0 = self._clock_zdot.clone()
         
-        # k1 = f(clock)
-        k1 = self.clock_grad()
+        # k1
+        k1_z, k1_zdot = self._clock_rhs(z0, zdot0)
         
-        # k2: clock + h*k1/2
-        self.clock = clock_orig + (h / 2) * k1
-        self.clock.requires_grad_(True)
-        k2 = self.clock_grad()
+        # k2
+        z2 = z0 + h/2 * k1_z
+        zdot2 = zdot0 + h/2 * k1_zdot
+        k2_z, k2_zdot = self._clock_rhs(z2, zdot2)
         
-        # k3: clock + h*k2/2
-        self.clock = clock_orig + (h / 2) * k2
-        self.clock.requires_grad_(True)
-        k3 = self.clock_grad()
+        # k3
+        z3 = z0 + h/2 * k2_z
+        zdot3 = zdot0 + h/2 * k2_zdot
+        k3_z, k3_zdot = self._clock_rhs(z3, zdot3)
         
-        # k4: clock + h*k3
-        self.clock = clock_orig + h * k3
-        self.clock.requires_grad_(True)
-        k4 = self.clock_grad()
+        # k4
+        z4 = z0 + h * k3_z
+        zdot4 = zdot0 + h * k3_zdot
+        k4_z, k4_zdot = self._clock_rhs(z4, zdot4)
         
-        # Update clock using RK4 formula
-        self.clock = clock_orig + (h / 6) * (k1 + 2*k2 + 2*k3 + k4)
-        self.clock.requires_grad_(True)
+        # Update
+        self._clock_z.copy_(z0 + h/6 * (k1_z + 2*k2_z + 2*k3_z + k4_z))
+        self._clock_zdot.copy_(zdot0 + h/6 * (k1_zdot + 2*k2_zdot + 2*k3_zdot + k4_zdot))
         
     def total_energy(self, x: torch.Tensor, phases : torch.Tensor, beta=0.0, y=None, criterion=None):
         """
@@ -1481,8 +1474,8 @@ class VDP_MLP(torch.nn.Module):
         energy = torch.zeros(batch_size, device=device) # i.e. we want a separate energy for each batch element so we can calculate energy gradient descent dynamics for each batch element independently
         x_flat = x.view(batch_size, -1)
         
-        # Concatenate clock to end of input
-        clock_expanded = (torch.ones(1,dtype=torch.complex128,device=device)*self.clock).unsqueeze(0).expand(batch_size, -1)  # Shape: [batch_size, 1]
+        # Concatenate clock to end of input (buffer is already on correct device)
+        clock_expanded = self.clock.unsqueeze(0).expand(batch_size, -1)  # Shape: [batch_size, 1]
         x_flat = torch.cat([x_flat, clock_expanded], dim=1)  # Shape: [batch_size, input_dim + 1]
         energy_J_input = -torch.sum(((x_flat.unsqueeze(2) - phases[0].unsqueeze(1)).abs()**2) * self.synapses[0].weight.T, dim=(1,2))  # Shape: [batch_size]
         
@@ -1579,49 +1572,56 @@ class VDP_MLP(torch.nn.Module):
             k2 = f(t_n + h/2, y_n + h*k1/2)
             k3 = f(t_n + h/2, y_n + h*k2/2)
             k4 = f(t_n + h, y_n + h*k3)
+        
+        Note: Intermediate phases are detached to avoid building computation graph
         """
         h = self.epsilon  # step size
         
         # k1 = f(phases)
-        k1 = self._compute_phase_derivatives(x, phases, beta, y, criterion, noise_level)
+        k1, grads1 = self._compute_phase_derivatives(x, phases, beta, y, criterion, noise_level)
+        # Detach k1 to avoid graph accumulation
+        k1 = [k.detach() for k in k1]
         
         # Intermediate phases for k2: phases + h*k1/2
         phases_k2 = []
         for idx, phase in enumerate(phases):
-            phase_k2 = phase + (h / 2) * k1[idx]
-            phase_k2.requires_grad_(True)
+            phase_k2 = (phase.detach() + (h / 2) * k1[idx]).requires_grad_(True)
             phases_k2.append(phase_k2)
-        k2 = self._compute_phase_derivatives(x, phases_k2, beta, y, criterion, noise_level)
+        k2, grads2 = self._compute_phase_derivatives(x, phases_k2, beta, y, criterion, noise_level)
+        k2 = [k.detach() for k in k2]
         
         # Intermediate phases for k3: phases + h*k2/2
         phases_k3 = []
         for idx, phase in enumerate(phases):
-            phase_k3 = phase + (h / 2) * k2[idx]
-            phase_k3.requires_grad_(True)
+            phase_k3 = (phase.detach() + (h / 2) * k2[idx]).requires_grad_(True)
             phases_k3.append(phase_k3)
-        k3 = self._compute_phase_derivatives(x, phases_k3, beta, y, criterion, noise_level)
+        k3, grads3 = self._compute_phase_derivatives(x, phases_k3, beta, y, criterion, noise_level)
+        k3 = [k.detach() for k in k3]
         
         # Intermediate phases for k4: phases + h*k3
         phases_k4 = []
         for idx, phase in enumerate(phases):
-            phase_k4 = phase + h * k3[idx]
-            phase_k4.requires_grad_(True)
+            phase_k4 = (phase.detach() + h * k3[idx]).requires_grad_(True)
             phases_k4.append(phase_k4)
-        k4 = self._compute_phase_derivatives(x, phases_k4, beta, y, criterion, noise_level)
+        k4, grads4 = self._compute_phase_derivatives(x, phases_k4, beta, y, criterion, noise_level)
+        k4 = [k.detach() for k in k4]
         
-        # Update phases using RK4 formula
+        # Update phases using RK4 formula (detach from intermediate graph, keep grad for next iteration)
         new_phases = []
         for idx, phase in enumerate(phases):
-            new_phase = phase + (h / 6) * (k1[idx] + 2*k2[idx] + 2*k3[idx] + k4[idx])
+            new_phase = phase.detach() + (h / 6) * (k1[idx] + 2*k2[idx] + 2*k3[idx] + k4[idx])
             
             if check_thm:
+                new_phase.requires_grad_(True)
                 new_phase.retain_grad()
             else:
                 new_phase.requires_grad_(True)
                 
             new_phases.append(new_phase)
         
-        return new_phases
+        # Return final grads (detached to avoid graph storage)
+        grads4 = [g.detach() for g in grads4]
+        return new_phases, grads4
 
     def forward(self, x, y, phases, T, beta=0.0, criterion=torch.nn.MSELoss(reduction='none'), check_thm=False, plot=False, phase_type="Free", return_velocities=False, plot_idx=0, noise_level=0.0): 
         # Note reduction='none' is important for OIM as we want to keep the loss as a vector of size [batch_size] to compute energy gradient descent dynamcis independently for each batch element
@@ -1878,8 +1878,8 @@ class VDP_MLP(torch.nn.Module):
         
         delta_energy = ((energy_pos_real-energy_neg_real)+1j*(energy_pos_im-energy_neg_im)) / (2 ** 0.5) * beta
         
-        # Backward pass to get gradients
-        delta_energy.backward()
+        # Backward pass to get gradients (take real part since we can only backprop through real scalars)
+        delta_energy.real.backward()
 
 ###  ###
         
