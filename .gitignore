@@ -3,6 +3,7 @@ results/
 __pycache__/
 cifar10_pytorch/
 mnist_pytorch/
+fashion_mnist_pytorch/
 *.sh
 *.pyc
 imagenet_samples/

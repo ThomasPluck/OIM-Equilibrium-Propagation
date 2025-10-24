@@ -12,6 +12,69 @@ import time
 import math
 
 
+### VRAM CACHING ###
+
+def cache_to_vram(dataset, device):
+    """
+    Cache entire dataset to GPU VRAM.
+    DataLoader will serve batches directly from HBM (900 GB/s vs PCIe's 12 GB/s).
+    
+    Parameters:
+    - dataset: PyTorch dataset to cache
+    - device: Target GPU device
+    
+    Returns:
+    - VRAMDataset: Dataset that serves from GPU memory
+    """
+    print(f"Caching {len(dataset)} samples to {device}...", flush=True)
+    
+    # Use temporary loader for initial cache load
+    temp_loader = torch.utils.data.DataLoader(
+        dataset, 
+        batch_size=1000, 
+        num_workers=0,  # Simple single-threaded loading
+        pin_memory=False,
+        shuffle=False
+    )
+    
+    data_list = []
+    target_list = []
+    
+    for data, target in temp_loader:
+        data_list.append(data)
+        target_list.append(target)
+    
+    # Concatenate and move to GPU in one shot
+    all_data = torch.cat(data_list, dim=0).to(device)
+    all_targets = torch.cat(target_list, dim=0).to(device)
+    
+    vram_mb = (all_data.element_size() * all_data.nelement() + 
+               all_targets.element_size() * all_targets.nelement()) / 1e6
+    
+    print(f"✓ Cached {len(dataset)} samples to VRAM ({vram_mb:.1f} MB)", flush=True)
+    
+    return VRAMDataset(all_data, all_targets)
+
+
+class VRAMDataset(torch.utils.data.Dataset):
+    """
+    Dataset that serves batches directly from GPU VRAM.
+    DataLoader indexing happens at HBM bandwidth (~900 GB/s).
+    """
+    def __init__(self, data, targets):
+        self.data = data
+        self.targets = targets
+    
+    def __len__(self):
+        return len(self.data)
+    
+    def __getitem__(self, idx):
+        # Direct VRAM indexing - zero copy overhead
+        return self.data[idx], self.targets[idx]
+
+### ###
+
+
 
 
 
@@ -146,10 +209,34 @@ def generate_mnist(args):
 
 
     # Create the data loaders
-    # Use multiple workers for asynchronous data loading
-    print(f"Using num_workers={args.num_workers} for DataLoaders.")
-    train_loader = torch.utils.data.DataLoader(mnist_dset_train, batch_size=args.mbs, shuffle=True, num_workers=args.num_workers, persistent_workers=True, pin_memory=True)
-    test_loader = torch.utils.data.DataLoader(mnist_dset_test, batch_size=200, shuffle=False, num_workers=args.num_workers, persistent_workers=True, pin_memory=True)
+    # Check if VRAM caching is enabled
+    if hasattr(args, 'cache_to_gpu') and args.cache_to_gpu and torch.cuda.is_available():
+        print(f"\n{'='*60}")
+        print("VRAM CACHING ENABLED - Caching dataset to GPU")
+        print(f"{'='*60}")
+        
+        # Cache datasets to VRAM
+        mnist_dset_train = cache_to_vram(mnist_dset_train, args.device)
+        mnist_dset_test = cache_to_vram(mnist_dset_test, args.device)
+        
+        print(f"✓ DataLoaders configured for VRAM access")
+        print(f"{'='*60}\n")
+    
+    # Always use num_workers=0 and no pin_memory (simplicity)
+    train_loader = torch.utils.data.DataLoader(
+        mnist_dset_train, 
+        batch_size=args.mbs, 
+        shuffle=True, 
+        num_workers=0,
+        pin_memory=False
+    )
+    test_loader = torch.utils.data.DataLoader(
+        mnist_dset_test, 
+        batch_size=200, 
+        shuffle=False, 
+        num_workers=0,
+        pin_memory=False
+    )
 
 
     if args.debug:
@@ -235,10 +322,34 @@ def generate_fashion_mnist(args):
 
 
     # Create the data loaders
-    # Use multiple workers for asynchronous data loading
-    print(f"Using num_workers={args.num_workers} for Fashion-MNIST DataLoaders.")
-    train_loader = torch.utils.data.DataLoader(fashion_mnist_dset_train, batch_size=args.mbs, shuffle=True, num_workers=args.num_workers, persistent_workers=True, pin_memory=True)
-    test_loader = torch.utils.data.DataLoader(fashion_mnist_dset_test, batch_size=200, shuffle=False, num_workers=args.num_workers, persistent_workers=True, pin_memory=True)
+    # Check if VRAM caching is enabled
+    if hasattr(args, 'cache_to_gpu') and args.cache_to_gpu and torch.cuda.is_available():
+        print(f"\n{'='*60}")
+        print("VRAM CACHING ENABLED - Caching Fashion-MNIST to GPU")
+        print(f"{'='*60}")
+        
+        # Cache datasets to VRAM
+        fashion_mnist_dset_train = cache_to_vram(fashion_mnist_dset_train, args.device)
+        fashion_mnist_dset_test = cache_to_vram(fashion_mnist_dset_test, args.device)
+        
+        print(f"✓ DataLoaders configured for VRAM access")
+        print(f"{'='*60}\n")
+    
+    # Always use num_workers=0 and no pin_memory (simplicity)
+    train_loader = torch.utils.data.DataLoader(
+        fashion_mnist_dset_train, 
+        batch_size=args.mbs, 
+        shuffle=True, 
+        num_workers=0,
+        pin_memory=False
+    )
+    test_loader = torch.utils.data.DataLoader(
+        fashion_mnist_dset_test, 
+        batch_size=200, 
+        shuffle=False, 
+        num_workers=0,
+        pin_memory=False
+    )
 
 
     if args.debug:
@@ -253,6 +364,143 @@ def generate_fashion_mnist(args):
         # Verify data size
         print(f"Fashion-MNIST train data size: {len(fashion_mnist_dset_train)}")
         print(f"Fashion-MNIST test data size: {len(fashion_mnist_dset_test)}")
+
+    return train_loader, test_loader
+
+
+def generate_cifar10(args):
+    '''
+    Generate CIFAR-10 dataloaders
+    If input_positive_negative_remapping is True, remaps pixel values from [0,1] to [-1,1]
+    '''
+
+    # Use custom training and test data size (defaults: 50000 train, 10000 test)
+    N_data_train = getattr(args, 'N_data_train', 50000)
+    N_data_test = getattr(args, 'N_data_test', 10000)
+    N_class = 10
+    
+    if args.input_positive_negative_mapping:
+        # Normalize to [-1, 1] range
+        transform_train = torchvision.transforms.Compose([
+            torchvision.transforms.ToTensor(),
+            torchvision.transforms.Normalize(mean=(0.5, 0.5, 0.5), std=(0.5, 0.5, 0.5))  # Maps [0,1] to [-1,1]
+        ])
+        transform_test = torchvision.transforms.Compose([
+            torchvision.transforms.ToTensor(),
+            torchvision.transforms.Normalize(mean=(0.5, 0.5, 0.5), std=(0.5, 0.5, 0.5))
+        ])
+    else:
+        # Keep in [0, 1] range
+        transform_train = torchvision.transforms.Compose([
+            torchvision.transforms.ToTensor()
+        ])
+        transform_test = torchvision.transforms.Compose([
+            torchvision.transforms.ToTensor()
+        ])
+    
+    # Add data augmentation if requested
+    if getattr(args, 'data_aug', False):
+        transform_train = torchvision.transforms.Compose([
+            torchvision.transforms.RandomCrop(32, padding=4),
+            torchvision.transforms.RandomHorizontalFlip(),
+            transform_train.transforms[0],  # ToTensor
+            transform_train.transforms[1] if len(transform_train.transforms) > 1 else torchvision.transforms.Lambda(lambda x: x)  # Normalize if present
+        ])
+
+    # Training data
+    cifar10_dset_train = torchvision.datasets.CIFAR10(
+        './cifar10_pytorch', 
+        train=True, 
+        transform=transform_train, 
+        target_transform=None, 
+        download=True
+    )
+    
+    # If requesting exact full dataset size, skip the subsampling
+    use_full_train = (N_data_train == 50000)
+    use_full_test = (N_data_test == 10000)
+    
+    if not use_full_train:
+        # Reduce training dataset size to N_data_train points, but keep the same number per class
+        indices = []
+        targets_tensor = torch.tensor(cifar10_dset_train.targets)
+        comp = torch.zeros(N_class)
+        for idx, target in enumerate(targets_tensor):
+            if comp[target] < N_data_train / N_class:
+                indices.append(idx)
+                comp[target] += 1
+            if len(indices) == N_data_train:
+                break
+        
+        cifar10_dset_train.data = cifar10_dset_train.data[indices]
+        cifar10_dset_train.targets = [cifar10_dset_train.targets[i] for i in indices]
+
+    # Testing data
+    cifar10_dset_test = torchvision.datasets.CIFAR10(
+        './cifar10_pytorch', 
+        train=False, 
+        transform=transform_test, 
+        target_transform=None, 
+        download=True
+    )
+    
+    if not use_full_test:
+        # Reduce test dataset size
+        indices = []
+        targets_tensor = torch.tensor(cifar10_dset_test.targets)
+        comp = torch.zeros(N_class)
+        for idx, target in enumerate(targets_tensor):
+            if comp[target] < N_data_test / N_class:
+                indices.append(idx)
+                comp[target] += 1
+            if len(indices) == N_data_test:
+                break
+        
+        cifar10_dset_test.data = cifar10_dset_test.data[indices]
+        cifar10_dset_test.targets = [cifar10_dset_test.targets[i] for i in indices]
+
+    # Create the data loaders
+    # Check if VRAM caching is enabled
+    if hasattr(args, 'cache_to_gpu') and args.cache_to_gpu and torch.cuda.is_available():
+        print(f"\n{'='*60}")
+        print("VRAM CACHING ENABLED - Caching CIFAR-10 to GPU")
+        print(f"{'='*60}")
+        
+        # Cache datasets to VRAM
+        cifar10_dset_train = cache_to_vram(cifar10_dset_train, args.device)
+        cifar10_dset_test = cache_to_vram(cifar10_dset_test, args.device)
+        
+        print(f"✓ DataLoaders configured for VRAM access")
+        print(f"{'='*60}\n")
+    
+    # Always use num_workers=0 and no pin_memory (simplicity)
+    train_loader = torch.utils.data.DataLoader(
+        cifar10_dset_train, 
+        batch_size=args.mbs, 
+        shuffle=True, 
+        num_workers=0,
+        pin_memory=False
+    )
+    test_loader = torch.utils.data.DataLoader(
+        cifar10_dset_test, 
+        batch_size=200, 
+        shuffle=False, 
+        num_workers=0,
+        pin_memory=False
+    )
+
+    if getattr(args, 'debug', False):
+        # Verify data ranges
+        for batch, _ in train_loader:
+            print(f"CIFAR-10 data range verification:")
+            print(f"Min pixel value: {batch.min():.4f}")
+            print(f"Max pixel value: {batch.max():.4f}")
+            print(f"Shape: {batch.shape}")  # Should be [batch_size, 3, 32, 32]
+            break
+
+        # Verify data size
+        print(f"CIFAR-10 train data size: {len(cifar10_dset_train)}")
+        print(f"CIFAR-10 test data size: {len(cifar10_dset_test)}")
 
     return train_loader, test_loader
 

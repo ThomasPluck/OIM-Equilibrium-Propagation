@@ -475,14 +475,16 @@ class OIM_MLP(torch.nn.Module):
                                     grad_outputs=torch.ones_like(energies), # This is the default anyway, but note autograd.grad(y,x)...
                                     create_graph=check_thm) # i.e. keep graph so we can computer derivatives of derivatives (if check_thm=True)
             
-            
+            # MEMORY LEAK FIX: Detach gradients to prevent graph accumulation (unless checking theorem)
+            if not check_thm:
+                grads = [g.detach() for g in grads]
             
             # UPDATE PHASES USING GRADIENT DESCENT ON THE ENERGY
             
             # HIDDEN LAYERS
             for idx in range(len(phases)-1):
-                # Use out-of-place operation so we don't modify the original phases tensor and mess up gradient computation stuff
-                phases[idx] = phases[idx] - self.epsilon * grads[idx]
+                # MEMORY LEAK FIX: Detach from previous graph before update to prevent accumulation
+                phases[idx] = (phases[idx].detach() - self.epsilon * grads[idx]).requires_grad_(True)
                 
                 # Add noise if noise_level > 0
                 if noise_level > 0.0:
@@ -491,15 +493,14 @@ class OIM_MLP(torch.nn.Module):
                 
                 if check_thm:
                     phases[idx].retain_grad()
-                else:
-                    phases[idx].requires_grad_(True)
 
 
 
             
             # OUTPUT LAYER 
             # (no distinction between MSE and non-MSE here), we don't need to do activation function for either
-            phases[-1] = phases[-1] - self.epsilon * grads[-1]
+            # MEMORY LEAK FIX: Detach from previous graph before update
+            phases[-1] = (phases[-1].detach() - self.epsilon * grads[-1]).requires_grad_(True)
             
             # Add noise if noise_level > 0
             if noise_level > 0.0:
@@ -508,8 +509,6 @@ class OIM_MLP(torch.nn.Module):
 
             if check_thm:
                 phases[-1].retain_grad()
-            else:
-                phases[-1].requires_grad_(True)
 
 
 
@@ -989,8 +988,14 @@ class SL_MLP(torch.nn.Module):
                                     grad_outputs=torch.ones_like(energies),
                                     create_graph=False)
         
+        # MEMORY LEAK FIX: Detach gradients immediately to prevent graph accumulation
+        grads = [g.detach() for g in grads]
+        
         new_phases = []
         for _, (phase, grad) in enumerate(zip(phases, grads)):
+            # MEMORY LEAK FIX: Detach phase before decomposition to break grad history
+            phase = phase.detach()
+            
             # Decompose into radial and tangential
             r = phase.abs()
             theta = phase.angle()

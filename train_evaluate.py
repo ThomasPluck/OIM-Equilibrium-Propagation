@@ -546,7 +546,7 @@ def train(model, optimizer, train_loader, test_loader, args, device, criterion, 
         test_correct, test_loss_current, test_velocities, final_neurons = evaluate(model, test_loader, args.T1, device, 
                                                plot=args.plot, 
                                                return_velocities=(args.debug or args.wandb_mode != "disabled"),
-                                               criterion=criterion, noise_level=args.noise_level)
+                                               criterion=criterion, noise_level=args.noise_level, phase='Test')
         test_acc_current = test_correct/(len(test_loader.dataset))
         
         # Calculate metrics if tracking is enabled
@@ -716,7 +716,7 @@ def train(model, optimizer, train_loader, test_loader, args, device, criterion, 
 
 
             
-def evaluate(model, loader, T, device, plot=False, return_velocities=False, criterion=None, noise_level=0.0):
+def evaluate(model, loader, T, device, plot=False, return_velocities=False, criterion=None, noise_level=0.0, phase='Test'):
     """
     Evaluate the model on a dataloader with T steps for the dynamics
     
@@ -729,11 +729,11 @@ def evaluate(model, loader, T, device, plot=False, return_velocities=False, crit
     - return_velocities: Whether to return phase velocities
     - criterion: Loss function to use
     - noise_level: Level of noise to add during phase dynamics (only for OIM_MLP models)
+    - phase: 'Train' or 'Test' (for logging purposes)
     """
     model.eval()
     correct = 0
     total_loss = 0.0
-    phase = 'Train' if loader.dataset.train else 'Test'
     
     # Store neurons for metrics calculation
     final_neurons = None
@@ -761,9 +761,11 @@ def evaluate(model, loader, T, device, plot=False, return_velocities=False, crit
                 # For OIM models, convert phases to activations
                 model_output = model.activation(neurons[-1])
             elif isinstance(model, SL_MLP):
-                model_output = neurons[-1]
+                # For SL models, normalize by absolute value and take real part (neurons are complex-valued)
+                model_output = (neurons[-1] / neurons[-1].abs()).real
             elif isinstance(model, VDP_MLP):
-                model_output = neurons[-1] * model.clock
+                # For VDP models, multiply by clock/2 and take real part (clock is complex-valued)
+                model_output = (neurons[-1] * model.clock / 2).real
             else:
                 # For standard models like P_MLP, neurons already contain activations
                 model_output = neurons[-1]

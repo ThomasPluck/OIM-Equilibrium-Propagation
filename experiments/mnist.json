@@ -1,0 +1,142 @@
+{
+  "name": "Full Experimental Suite - Core Models",
+  "description": "SL_MLP, OIM_MLP, and P_MLP across MNIST and FashionMNIST with hyperparameter sweeps",
+  
+  "base_config": {
+    "epochs": 5,
+    "T1": 10,
+    "T2": 4,
+    "cache_to_gpu": true,
+    "save": true,
+    "thirdphase": true,
+    "mbs": 512,
+    "input_positive_negative_mapping": true
+  },
+  
+  "experiments": [
+
+        {
+      "name": "SL_MLP_MNIST",
+      "base": {
+        "model": "SL_MLP",
+        "task": "MNIST",
+        "alg": "EP",
+        "optim": "sgd",
+        "act": "identity",
+        "loss": "complex_mse",
+        "epsilon": 0.1
+      },
+      "grid": {
+        "archi": [[784, 256, 10]],
+        "betas": [[0.0, 0.1], [0.0, 0.2], [0.0, 0.05]],
+        "weight_lrs": [[0.01], [0.05], [0.1]]
+      },
+      "num_seeds": 5
+    },
+    
+    {
+      "name": "SL_MLP_FashionMNIST",
+      "base": {
+        "model": "SL_MLP",
+        "task": "FashionMNIST",
+        "alg": "EP",
+        "optim": "sgd",
+        "act": "identity",
+        "loss": "complex_mse",
+        "epsilon": 0.1
+      },
+      "grid": {
+        "archi": [[784, 256, 10]],
+        "betas": [[0.0, 0.1], [0.0, 0.2], [0.0, 0.05]],
+        "weight_lrs": [[0.01], [0.05], [0.1]]
+      },
+      "num_seeds": 5
+    },
+    
+    {
+      "name": "OIM_MLP_MNIST",
+      "base": {
+        "model": "OIM_MLP",
+        "task": "MNIST",
+        "alg": "EP",
+        "optim": "sgd",
+        "act": "cos",
+        "loss": "mse",
+        "epsilon": 0.05
+      },
+      "grid": {
+        "archi": [[784, 256, 10]],
+        "betas": [[0.0, 0.1], [0.0, 0.2], [0.0, 0.05]],
+        "weight_lrs": [[0.01], [0.05], [0.1]]
+      },
+      "num_seeds": 5
+    },
+    
+    {
+      "name": "OIM_MLP_FashionMNIST",
+      "base": {
+        "model": "OIM_MLP",
+        "task": "FashionMNIST",
+        "alg": "cos",
+        "optim": "sgd",
+        "act": "identity",
+        "loss": "mse",
+        "epsilon": 0.1
+      },
+      "grid": {
+        "archi": [[784, 256, 10]],
+        "betas": [[0.0, 0.1], [0.0, 0.2], [0.0, 0.05]],
+        "weight_lrs": [[0.01], [0.05], [0.1]]
+      },
+      "num_seeds": 5
+    }, 
+    {
+      "name": "P_MLP_MNIST_Baseline",
+      "base": {
+        "model": "P_MLP",
+        "task": "MNIST",
+        "alg": "BPTT",
+        "optim": "sgd",
+        "act": "tanh",
+        "loss": "mse"
+      },
+      "grid": {
+        "archi": [[784, 256, 10]],
+        "weight_lrs": [[0.01], [0.05], [0.1]]
+      },
+      "num_seeds": 5
+    },
+    
+    {
+      "name": "P_MLP_FashionMNIST_Baseline",
+      "base": {
+        "model": "P_MLP",
+        "task": "FashionMNIST",
+        "alg": "BPTT",
+        "optim": "sgd",
+        "act": "tanh",
+        "loss": "mse"
+      },
+      "grid": {
+        "archi": [[784, 256, 10]],
+        "weight_lrs": [[0.01], [0.05], [0.1]]
+      },
+      "num_seeds": 5
+    } , {
+      "name": "SL_MLP_BatchSize_Ablation",
+      "base": {
+        "model": "SL_MLP",
+        "task": "MNIST",
+        "epochs": 5,
+        "archi": [784, 256, 10],
+        "betas": [0.0, 0.1],
+        "weight_lrs": [0.05],
+        "epsilon": 0.1
+      },
+      "grid": {
+        "mbs": [16, 32, 64, 128]
+      },
+      "num_seeds": 3
+    }
+  ]
+}

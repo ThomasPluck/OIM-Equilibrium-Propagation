@@ -10,8 +10,10 @@ import numpy as np
 import os
 import sys
 import time
+import json
+import itertools
 from datetime import datetime
-import copy
+from copy import deepcopy
 
 # Import the ModelTrainer class directly
 from model_trainer import ModelTrainer
@@ -85,9 +87,14 @@ def get_args():
     # Multiprocessing-specific arguments
     parser.add_argument('--num-repeats', type=int, default=5, help='Number of parallel processes to run (default: 5)')
     parser.add_argument('--base-seed', type=int, default=1, help='Base seed for random number generation, processes will use base_seed+rank (default: 42)')
-    parser.add_argument('--num-workers', type=int, default=4, help='Number of workers per process for data loading (default: 4)')
     
-
+    # Performance optimization arguments
+    parser.add_argument('--cache-to-gpu', action='store_true', help='Cache entire dataset to GPU VRAM (eliminates PCIe bottleneck, recommended for MNIST/CIFAR)')
+    parser.add_argument('--multi-gpu', action='store_true', help='Distribute processes across all available GPUs in round-robin fashion')
+    
+    # Experiment grid search
+    parser.add_argument('--experiments-json', type=str, default=None, help='Path to JSON file defining experiment grid (overrides individual hyperparameters)')
+    parser.add_argument('--start-index', type=int, default=0, help='Index to start/resume experiments from (0-based)')
     # parser.add_argument('--pools', type = str, default = 'mm', metavar = 'p', help='pooling') 
     # parser.add_argument('--channels', nargs='+', type = int, default = [32, 64], metavar = 'C', help='channels of the convnet')
     # parser.add_argument('--kernels', nargs='+', type = int, default = [5, 5], metavar = 'K', help='kernels sizes of the convnet')
@@ -100,11 +107,20 @@ def get_args():
 
 def prepare_args_for_process(args, rank):
     """Prepare args for a specific process"""
-    proc_args = copy.deepcopy(args)
+    proc_args = deepcopy(args)
     
     # Set unique seed for this process
     proc_args.seed = args.base_seed + rank
     proc_args.rank = rank
+    
+    # Multi-GPU assignment: Distribute processes across available GPUs
+    if args.multi_gpu and torch.cuda.is_available():
+        num_gpus = torch.cuda.device_count()
+        proc_args.device = rank % num_gpus
+        print(f"[Process {rank}] Assigned to GPU {proc_args.device} (of {num_gpus} total)", flush=True)
+    else:
+        # Single GPU mode - use specified device
+        proc_args.device = args.device
 
     # Do different things depending on whether we are loading or not
     if args.load_path == '': # New run
@@ -123,21 +139,8 @@ def prepare_args_for_process(args, rank):
         proc_args.wandb_name = f"{overall_name}_model_{rank}"
         proc_args.wandb_id = f"{overall_name}_model_{rank}"
 
-
         # For loading, derive the specific model path
         proc_args.path = f'{args.load_path}/model_{rank}'
-
-        
-            
-    # When using multiple processes, adjust data loader workers to prevent system resource exhaustion
-    if args.num_repeats > 1:
-        # Calculate a reasonable number of workers per process based on CPU count
-        max_workers = max(1, (mp.cpu_count() // args.num_repeats) - 1)
-        # Cap the workers to the maximum reasonable value, but respect the user-provided value
-        proc_args.num_workers = min(args.num_workers, max_workers)
-        
-        if proc_args.num_workers != args.num_workers and args.num_workers > max_workers:
-            print(f"Process {rank}: Limiting num_workers from {args.num_workers} to {proc_args.num_workers} to prevent resource exhaustion")
 
     return proc_args
 
@@ -166,10 +169,247 @@ def run_process(rank, args):
         print(f"Process {rank} failed with error: {e}")
         traceback.print_exc()
 
+### EXPERIMENT GRID SEARCH FUNCTIONS ###
+
+def load_experiment_grid(json_path, start_index=0):
+    """
+    Load experiment grid from JSON file.
+    Returns list of experiment configurations.
+    """
+    with open(json_path, 'r') as f:
+        config = json.load(f)
+    
+    experiments = []
+    
+    for exp_group in config.get('experiments', []):
+        group_name = exp_group.get('name', 'unnamed')
+        base_config = exp_group.get('base', {})
+        grid = exp_group.get('grid', {})
+        num_seeds = exp_group.get('num_seeds', 1)
+        
+        # Merge base_config from top-level and experiment-level
+        merged_base = config.get('base_config', {}).copy()
+        merged_base.update(base_config)
+        
+        # Generate all combinations from grid
+        if grid:
+            keys = list(grid.keys())
+            values = list(grid.values())
+            combinations = list(itertools.product(*values))
+            
+            for combo in combinations:
+                exp_config = merged_base.copy()
+                for key, val in zip(keys, combo):
+                    exp_config[key] = val
+                
+                # Add multiple seeds for this configuration
+                for seed_offset in range(num_seeds):
+                    exp_with_seed = exp_config.copy()
+                    exp_with_seed['_seed_offset'] = seed_offset
+                    exp_with_seed['_group_name'] = group_name
+                    experiments.append(exp_with_seed)
+        else:
+            # No grid, just use base config with multiple seeds
+            for seed_offset in range(num_seeds):
+                exp_with_seed = merged_base.copy()
+                exp_with_seed['_seed_offset'] = seed_offset
+                exp_with_seed['_group_name'] = group_name
+                experiments.append(exp_with_seed)
+                
+    experiments = experiments[start_index:]
+    
+    return experiments
+
+def create_args_from_config(base_args, config_dict, exp_idx):
+    """
+    Create args namespace from experiment configuration dictionary.
+    """
+    args = deepcopy(base_args)
+    
+    # Apply all config values to args
+    for key, value in config_dict.items():
+        if key.startswith('_'):
+            # Skip internal keys (like _seed_offset, _group_name)
+            continue
+        
+        # Handle special cases
+        if hasattr(args, key):
+            setattr(args, key, value)
+        else:
+            # Add new attribute if it doesn't exist
+            setattr(args, key, value)
+    
+    # Set seed
+    seed_offset = config_dict.get('_seed_offset', 0)
+    args.seed = base_args.base_seed + exp_idx  # Use exp_idx for unique seed
+    
+    # Set rank and experiment ID
+    args.rank = exp_idx
+    
+    return args
+
+def print_experiment_summary(experiments):
+    """Print summary of experiments to run"""
+    print(f"\n{'='*70}")
+    print(f"EXPERIMENT GRID SUMMARY")
+    print(f"{'='*70}")
+    print(f"Total experiments: {len(experiments)}\n")
+    
+    # Group by experiment name
+    groups = {}
+    for exp in experiments:
+        group_name = exp.get('_group_name', 'unnamed')
+        if group_name not in groups:
+            groups[group_name] = 0
+        groups[group_name] += 1
+    
+    for group_name, count in groups.items():
+        print(f"  {group_name}: {count} experiments")
+    
+    print(f"{'='*70}\n")
+
+def run_experiment_grid(base_args):
+    """
+    Run experiment grid from JSON file.
+    Manages process pool across all experiments.
+    """
+    # Load experiments from JSON
+    print(f"Loading experiments from: {base_args.experiments_json}")
+    experiments = load_experiment_grid(base_args.experiments_json, base_args.start_index)
+    
+    # Print summary
+    print_experiment_summary(experiments)
+    
+    # Generate shared timestamp
+    date = datetime.now().strftime('%Y-%m-%d')
+    time_str = datetime.now().strftime('%H-%M-%S')
+    shared_timestamp = f"{date}_{time_str}"
+    base_args.shared_timestamp = shared_timestamp
+    
+    # Set float precision
+    if base_args.float64:
+        torch.set_default_dtype(torch.float64)
+        print('Using 64-bit floating point precision')
+    else:
+        print('Using default 32-bit floating point precision')
+    
+    # Set up multiprocessing
+    mp.set_start_method('spawn', force=True)
+    
+    # Clear CUDA cache
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+    
+    start_time = time.time()
+    
+    if base_args.multi_gpu and torch.cuda.is_available():
+        # Multi-GPU mode: Process pool
+        num_gpus = torch.cuda.device_count()
+        print(f"MULTI-GPU MODE: Running {len(experiments)} experiments on {num_gpus} GPUs")
+        print(f"Batch size: {num_gpus} concurrent processes\n")
+        
+        active_processes = {}  # {process: (exp_idx, exp_config)}
+        remaining_experiments = list(enumerate(experiments))
+        completed_count = 0
+        
+        # Start initial batch
+        while len(active_processes) < num_gpus and remaining_experiments:
+            exp_idx, exp_config = remaining_experiments.pop(0)
+            
+            # Create args for this experiment
+            exp_args = create_args_from_config(base_args, exp_config, exp_idx)
+            exp_args.device = exp_idx % num_gpus
+            
+            # Set experiment-specific paths
+            group_name = exp_config.get('_group_name', 'unnamed')
+            exp_name = f"{group_name}_exp{exp_idx:04d}"
+            exp_args.path = f'results/{base_args.wandb_group or "experiment_grid"}/{shared_timestamp}/{exp_name}'
+            exp_args.wandb_name = exp_name
+            exp_args.wandb_id = exp_name
+            
+            p = mp.Process(target=run_process, args=(exp_idx, exp_args))
+            p.start()
+            active_processes[p] = (exp_idx, exp_config)
+            print(f"[STARTED] Experiment {exp_idx}/{len(experiments)} ({group_name}) on GPU {exp_idx % num_gpus} (PID {p.pid})")
+        
+        # As processes complete, start new ones
+        while active_processes:
+            for p in list(active_processes.keys()):
+                if not p.is_alive():
+                    completed_idx, completed_config = active_processes.pop(p)
+                    p.join()
+                    completed_count += 1
+                    group_name = completed_config.get('_group_name', 'unnamed')
+                    print(f"[COMPLETED] Experiment {completed_idx} ({group_name}) - {completed_count}/{len(experiments)} total")
+                    
+                    # Start next experiment if any remain
+                    if remaining_experiments:
+                        exp_idx, exp_config = remaining_experiments.pop(0)
+                        
+                        exp_args = create_args_from_config(base_args, exp_config, exp_idx)
+                        exp_args.device = exp_idx % num_gpus
+                        
+                        group_name = exp_config.get('_group_name', 'unnamed')
+                        exp_name = f"{group_name}_exp{exp_idx:04d}"
+                        exp_args.path = f'results/{base_args.wandb_group or "experiment_grid"}/{shared_timestamp}/{exp_name}'
+                        exp_args.wandb_name = exp_name
+                        exp_args.wandb_id = exp_name
+                        
+                        new_p = mp.Process(target=run_process, args=(exp_idx, exp_args))
+                        new_p.start()
+                        active_processes[new_p] = (exp_idx, exp_config)
+                        print(f"[STARTED] Experiment {exp_idx}/{len(experiments)} ({group_name}) on GPU {exp_idx % num_gpus} (PID {new_p.pid})")
+                    break
+            
+            if active_processes:
+                import time as sleep_time
+                sleep_time.sleep(0.1)
+    else:
+        # Single-GPU mode: Run experiments sequentially
+        print(f"SINGLE-GPU MODE: Running {len(experiments)} experiments sequentially\n")
+        
+        for exp_idx, exp_config in enumerate(experiments):
+            # Create args for this experiment
+            exp_args = create_args_from_config(base_args, exp_config, exp_idx)
+            
+            # Set experiment-specific paths
+            group_name = exp_config.get('_group_name', 'unnamed')
+            exp_name = f"{group_name}_exp{exp_idx:04d}"
+            exp_args.path = f'results/{base_args.wandb_group or "experiment_grid"}/{shared_timestamp}/{exp_name}'
+            exp_args.wandb_name = exp_name
+            exp_args.wandb_id = exp_name
+            
+            print(f"[STARTED] Experiment {exp_idx+1}/{len(experiments)} ({group_name})")
+            
+            p = mp.Process(target=run_process, args=(exp_idx, exp_args))
+            p.start()
+            p.join()
+            
+            print(f"[COMPLETED] Experiment {exp_idx+1}/{len(experiments)} ({group_name})")
+    
+    elapsed = time.time() - start_time
+    print(f"\n{'='*70}")
+    print(f"ALL {len(experiments)} EXPERIMENTS COMPLETED")
+    print(f"Total time: {elapsed/3600:.2f} hours ({elapsed/60:.2f} minutes)")
+    print(f"{'='*70}\n")
+
 def main():
     """Main function for multiprocessing training"""
     ### ARGUMENTS ###
     args = get_args()
+    
+    # Check if running experiment grid
+    if args.experiments_json:
+        run_experiment_grid(args)
+        return
+    
+    # Original single-experiment mode
+    # AUTO-ADJUST: If multi-GPU is enabled, set num_repeats to match GPU count
+    if args.multi_gpu and torch.cuda.is_available():
+        num_gpus = torch.cuda.device_count()
+        if args.num_repeats != num_gpus:
+            print(f"Multi-GPU mode: Overriding --num-repeats from {args.num_repeats} to {num_gpus} (one process per GPU)")
+            args.num_repeats = num_gpus
     
     # Generate a single shared timestamp for all processes
     date = datetime.now().strftime('%Y-%m-%d')
@@ -187,6 +427,31 @@ def main():
     print('\t', args.mbs, '\t', args.T1, '\t', args.T2, '\t', args.epochs, '\t', 
           args.act, '\t', args.betas, '\t', args.num_repeats)
     print('\n')
+    
+    ### PERFORMANCE OPTIMIZATION INFO ###
+    if args.multi_gpu and torch.cuda.is_available():
+        num_gpus = torch.cuda.device_count()
+        print('##################################################################')
+        print(f'MULTI-GPU MODE ENABLED')
+        print(f'Available GPUs: {num_gpus}')
+        print(f'Total processes: {args.num_repeats}')
+        print(f'Batch size: {num_gpus} concurrent processes')
+        print(f'GPU assignment: Round-robin (process_id % {num_gpus})')
+        
+        # Show first batch
+        first_batch = min(num_gpus, args.num_repeats)
+        for i in range(first_batch):
+            print(f'  Process {i} → GPU {i % num_gpus}')
+        if args.num_repeats > num_gpus:
+            print(f'  ... (processes will queue and run in batches of {num_gpus})')
+        print('##################################################################\n')
+    
+    if args.cache_to_gpu:
+        print('##################################################################')
+        print('VRAM CACHING ENABLED')
+        print('Dataset will be cached to GPU memory')
+        print('Expected speedup: 5-10× per epoch')
+        print('##################################################################\n')
 
     ### FLOAT PRECISION ###
     if args.float64:
@@ -201,23 +466,63 @@ def main():
     mp.set_start_method('spawn', force=True)
 
     # Start processes
-    processes = []
     start_time = time.time()
 
     # Clear CUDA cache before starting processes
     if torch.cuda.is_available():
         torch.cuda.empty_cache()
 
-    print(f"Starting {args.num_repeats} training processes...")
-    for rank in range(args.num_repeats):
-        p = mp.Process(target=run_process, args=(rank, args))
-        p.start()
-        processes.append(p)
-        print(f"Started process {rank} with PID {p.pid}")
-    
-    # Wait for all processes to finish
-    for p in processes:
-        p.join()
+    if args.multi_gpu and torch.cuda.is_available():
+        # Multi-GPU mode: Use process pool to run in batches
+        num_gpus = torch.cuda.device_count()
+        active_processes = {}  # {process: rank}
+        remaining_ranks = list(range(args.num_repeats))
+        
+        print(f"Starting {args.num_repeats} training processes in batches of {num_gpus}...\n")
+        
+        # Start initial batch (up to num_gpus processes)
+        while len(active_processes) < num_gpus and remaining_ranks:
+            rank = remaining_ranks.pop(0)
+            p = mp.Process(target=run_process, args=(rank, args))
+            p.start()
+            active_processes[p] = rank
+            print(f"[STARTED] Process {rank} on GPU {rank % num_gpus} (PID {p.pid})")
+        
+        # As processes complete, start new ones
+        while active_processes:
+            # Wait for any process to finish
+            for p in list(active_processes.keys()):
+                if not p.is_alive():
+                    completed_rank = active_processes.pop(p)
+                    p.join()
+                    print(f"[COMPLETED] Process {completed_rank}")
+                    
+                    # Start next process if any remain
+                    if remaining_ranks:
+                        rank = remaining_ranks.pop(0)
+                        new_p = mp.Process(target=run_process, args=(rank, args))
+                        new_p.start()
+                        active_processes[new_p] = rank
+                        print(f"[STARTED] Process {rank} on GPU {rank % num_gpus} (PID {new_p.pid})")
+                    break
+            
+            # Small sleep to avoid busy-waiting
+            if active_processes:
+                import time as sleep_time
+                sleep_time.sleep(0.1)
+    else:
+        # Single-GPU mode: Spawn all processes at once (original behavior)
+        processes = []
+        print(f"Starting {args.num_repeats} training processes...")
+        for rank in range(args.num_repeats):
+            p = mp.Process(target=run_process, args=(rank, args))
+            p.start()
+            processes.append(p)
+            print(f"Started process {rank} with PID {p.pid}")
+        
+        # Wait for all processes to finish
+        for p in processes:
+            p.join()
 
     # Report completion
     print("\n==== Training Complete ====")

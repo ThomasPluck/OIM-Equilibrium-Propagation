@@ -22,6 +22,11 @@ from train_evaluate import *
 from data_utils import *
 from model_utils import *
 
+# Define identity activation function at module level for pickling
+def identity_activation(x):
+    """Identity activation function (returns input unchanged)"""
+    return x
+
 
 class ModelTrainer:
     """
@@ -263,7 +268,7 @@ class ModelTrainer:
         elif act_name == 'ctrd_hard_sig':
             return ctrd_hard_sig
         elif act_name == 'identity':
-            return lambda x : x
+            return identity_activation
         else:
             print(f"Warning: Unknown activation '{act_name}', defaulting to cos")
             return torch.cos
@@ -457,8 +462,11 @@ class ModelTrainer:
             train_loader, test_loader = generate_mnist(self.args)
         elif self.args.task == 'FashionMNIST':
             train_loader, test_loader = generate_fashion_mnist(self.args)
+        elif self.args.task == 'CIFAR10':
+            from data_utils import generate_cifar10
+            train_loader, test_loader = generate_cifar10(self.args)
         else:
-            raise ValueError(f"Task {self.args.task} not supported")
+            raise ValueError(f"Task {self.args.task} not supported. Supported tasks: MNIST, FashionMNIST, CIFAR10")
             
         return train_loader, test_loader
     
@@ -601,7 +609,8 @@ class ModelTrainer:
             self.device, 
             plot=self.args.plot, 
             criterion=self.criterion, 
-            noise_level=self.args.noise_level
+            noise_level=self.args.noise_level,
+            phase='Train'
         )
         
         # Evaluate on test set
@@ -613,7 +622,8 @@ class ModelTrainer:
             self.device, 
             plot=self.args.plot, 
             criterion=self.criterion, 
-            noise_level=self.args.noise_level
+            noise_level=self.args.noise_level,
+            phase='Test'
         )
         
         # Calculate and print metrics

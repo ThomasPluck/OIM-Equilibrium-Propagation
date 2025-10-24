@@ -1,0 +1,36 @@
+{
+  "name": "Small Test Suite",
+  "description": "Quick test with minimal experiments to verify grid search works",
+  
+  "base_config": {
+    "epochs": 5,
+    "T1": 10,
+    "T2": 4,
+    "cache_to_gpu": true,
+    "save": false,
+    "thirdphase": true,
+    "input_positive_negative_mapping": true
+  },
+  
+  "experiments": [
+    {
+      "name": "SL_MLP_CIFAR10",
+      "base": {
+        "model": "SL_MLP",
+        "task": "CIFAR10",
+        "alg": "EP",
+        "optim": "sgd",
+        "act": "identity",
+        "loss": "complex_mse",
+        "epsilon": 0.1
+      },
+      "grid": {
+        "archi": [[3072, 512, 10]],
+        "betas": [[0.0, 0.05], [0.0, 0.025], [0.0, 0.01]],
+        "weight_lrs": [[0.01], [0.05], [0.1]],
+        "mbs": [64]
+      },
+      "num_seeds": 5
+    }
+  ]
+}
